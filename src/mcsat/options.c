@@ -29,5 +29,10 @@ extern void init_mcsat_options(mcsat_options_t *opts) {
   opts->bv_var_size = -1;
   opts->model_interpolation = false;
   opts->partial_restart = false;
+  opts->bool_freq = 0.3;
+  opts->nta_delta_set = true;
+  opts->nta_delta = 3;
+  opts->div_neq0 = true;
+  opts->no_sin_period = true;
 }
 

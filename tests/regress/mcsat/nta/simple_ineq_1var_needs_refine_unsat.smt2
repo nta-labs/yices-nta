@@ -1,0 +1,10 @@
+(set-logic QF_NRA)
+(set-info :status unsat)
+(declare-fun x () Real)
+(declare-fun sin (Real) Real)
+(assert (< x 0.5))
+(assert (> x 0.3))
+(assert (< (sin x) 0.7))
+(assert (> (sin x) 0.48))
+(check-sat)
+

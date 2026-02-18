@@ -117,6 +117,10 @@ static int32_t mcsat_na_bound_min;
 static int32_t mcsat_na_bound_max;
 static int32_t mcsat_bv_var_size;
 static bool mcsat_partial_restart;
+static double mcsat_bool_freq;
+static int32_t mcsat_nta_delta;
+static bool mcsat_div_neq0;
+static bool mcsat_no_sin_period;
 
 static pvector_t trace_tags;
 
@@ -173,7 +177,11 @@ typedef enum optid {
   mcsat_na_bound_min_opt, // set initial bound
   mcsat_na_bound_max_opt, // set maximal bound
   mcsat_bv_var_size_opt,   // set size of bitvector variables
+  mcsat_nta_delta_opt,     // set NTA delta parameter
+  mcsat_div_neq0_opt,      // use div-neq0 lemma in mcsat preprocessing
+  mcsat_no_sin_period_opt, // disable period variable for sin abstraction
   mcsat_partial_restart_opt, // enable partial restart heuristic in MCSAT
+  mcsat_bool_freq_opt,      // decide boolean variables before theory variables with frequency
   trace_opt,               // enable a trace tag
   show_ef_help_opt,        // print help about the ef options
   ematch_en_opt,                    // enable ematching
@@ -225,7 +233,11 @@ static option_desc_t options[NUM_OPTIONS] = {
   { "mcsat-na-bound-min", '\0', MANDATORY_INT, mcsat_na_bound_min_opt },
   { "mcsat-na-bound-max", '\0', MANDATORY_INT, mcsat_na_bound_max_opt },
   { "mcsat-bv-var-size", '\0', MANDATORY_INT, mcsat_bv_var_size_opt },
+  { "mcsat-nta-delta", '\0', MANDATORY_INT, mcsat_nta_delta_opt },
+  { "mcsat-div-neq0", '\0', FLAG_OPTION, mcsat_div_neq0_opt },
+  { "mcsat-no-sin-period", '\0', FLAG_OPTION, mcsat_no_sin_period_opt },
   { "mcsat-partial-restart", '\0', FLAG_OPTION, mcsat_partial_restart_opt },
+  { "mcsat-bool-freq", '\0', MANDATORY_FLOAT, mcsat_bool_freq_opt },
   { "trace", 't', MANDATORY_STRING, trace_opt },
   { "ef-help", '0', FLAG_OPTION, show_ef_help_opt },
   { "ematch", '\0', FLAG_OPTION, ematch_en_opt },
@@ -300,12 +312,16 @@ static void print_mcsat_help(const char *progname) {
   printf("MCSat options:\n"
 	 "    --mcsat-rand-dec-freq=<B> Set the random decision frequency [0,1] (default = 0.02)\n"
 	 "    --mcsat-rand-dec-seed=<B> Set the random decision seed (postive value)\n"
+      "    --mcsat-bool-first       Decide Boolean variables before theory variables\n"
          "    --mcsat-na-mgcd          Use model-based GCD instead of PSC for projection\n"
          "    --mcsat-na-nlsat         Use NLSAT projection instead of Brown's single-cell construction\n"
          "    --mcsat-na-bound         Search by increasing the bound on variable magnitude\n"
          "    --mcsat-na-bound-min=<B> Set initial lower bound\n"
          "    --mcsat-na-bound-max=<B> Set maximal bound for search\n"
          "    --mcsat-bv-var-size=<B>   Set size of bit-vector variables in MCSAT search\n"
+         "    --mcsat-nta-delta=<D>     Set NTA delta parameter (positive integer)\n"
+         "    --mcsat-div-neq0          Use div-neq0 lemma instead of implication\n"
+         "    --mcsat-no-sin-period     Disable period variable for sin abstraction\n"
          "    --mcsat-partial-restart   Enable partial restart heuristic in MCSAT search"
          "\n");
   fflush(stdout);
@@ -408,7 +424,11 @@ static void parse_command_line(int argc, char *argv[]) {
   mcsat_na_bound_min = -1;
   mcsat_na_bound_max = -1;
   mcsat_bv_var_size = -1;
+  mcsat_nta_delta = -1;
   mcsat_partial_restart = false;
+  mcsat_bool_freq = 0.3;
+  mcsat_div_neq0 = false;
+  mcsat_no_sin_period = false;
 
   init_pvector(&trace_tags, 5);
 
@@ -605,8 +625,30 @@ static void parse_command_line(int argc, char *argv[]) {
         mcsat_bv_var_size = elem.i_value;
         break;
 
+      case mcsat_nta_delta_opt:
+        if (! yices_has_mcsat()) goto no_mcsat;
+        if (! validate_integer_option(&parser, &elem, 1, INT32_MAX)) goto bad_usage;
+        mcsat_nta_delta = elem.i_value;
+        break;
+
+      case mcsat_div_neq0_opt:
+        if (! yices_has_mcsat()) goto no_mcsat;
+        mcsat_div_neq0 = true;
+        break;
+
+      case mcsat_no_sin_period_opt:
+        if (! yices_has_mcsat()) goto no_mcsat;
+        mcsat_no_sin_period = true;
+        break;
+
       case mcsat_partial_restart_opt:
         mcsat_partial_restart = true;
+        break;
+
+      case mcsat_bool_freq_opt:
+        if (! yices_has_mcsat()) goto no_mcsat;
+        if (! validate_double_option(&parser, &elem, 0.0, false, 1.0, false)) goto bad_usage;
+        mcsat_bool_freq = elem.d_value;
         break;
 
       case show_ef_help_opt:
@@ -843,8 +885,37 @@ static void setup_options_mcsat(void) {
     q_clear(&q);
   }
 
+  if (mcsat_nta_delta > 0) {
+    aval_t aval_delta;
+    rational_t q;
+    q_init(&q);
+    q_set32(&q, mcsat_nta_delta);
+    aval_delta = attr_vtbl_rational(__smt2_globals.avtbl, &q);
+    smt2_set_option(":yices-mcsat-nta-delta", aval_delta);
+    q_clear(&q);
+  }
+
+  if (mcsat_div_neq0) {
+    smt2_set_option(":yices-div-neq0", aval_true);
+  }
+
+  if (mcsat_no_sin_period) {
+    smt2_set_option(":yices-mcsat-no-sin-period", aval_true);
+  }
+
   if (mcsat_partial_restart) {
     smt2_set_option(":yices-mcsat-partial-restart", aval_true);
+  }
+
+  if (mcsat_bool_freq >= 0) {
+    aval_t aval_rand;
+    rational_t q;
+    q_init(&q);
+    // accurate upto 3 decimal places
+    q_set_int32(&q, (int32_t)(mcsat_bool_freq*1000), 1000);
+    aval_rand = attr_vtbl_rational(__smt2_globals.avtbl, &q);
+    smt2_set_option(":yices-mcsat-bool-freq", aval_rand);
+    q_clear(&q);
   }
 }
 

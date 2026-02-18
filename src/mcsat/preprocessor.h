@@ -24,12 +24,14 @@
 #include "options.h"
 #include "mcsat/utils/scope_holder.h"
 
+#include "mcsat/nta_info.h"
+
 #include <setjmp.h>
 
 #ifndef MCSAT_PREPROCESSOR_H_
 #define MCSAT_PREPROCESSOR_H_
 
-typedef struct {
+typedef struct preprocessor_s {
 
   /** Term table */
   term_table_t* terms;
@@ -39,6 +41,9 @@ typedef struct {
 
   /** Map from terms to their preprocessed version */
   int_hmap_t preprocess_map;
+
+  /** Inverse map from preprocessed terms to original terms */
+  int_hmap_t preprocess_inverse_map;
 
   /** List of terms in the preprocess map (for backtracking) */
   ivector_t preprocess_map_list;
@@ -61,6 +66,9 @@ typedef struct {
   /** Tracer */
   tracer_t* tracer;
 
+  /** Pointer to the global nta_info (same instance as in solver) */
+  nta_info_t* nta_info;
+
   /** MCSAT options */
   const mcsat_options_t* options;
 
@@ -81,8 +89,17 @@ void preprocessor_destruct(preprocessor_t* pre);
 /** Preprocess the term, add any additional assertions to output vector. */
 term_t preprocessor_apply(preprocessor_t* pre, term_t t, ivector_t* out, bool is_assertion);
 
+/** Get preprocessed term if present, or NULL_TERM otherwise. */
+term_t preprocessor_get(preprocessor_t* pre, term_t t);
+
+/** Get original term mapped to t_pre, or NULL_TERM otherwise. */
+term_t preprocessor_get_inverse(preprocessor_t* pre, term_t t_pre);
+
 /** Set tracer */
 void preprocessor_set_tracer(preprocessor_t* pre, tracer_t* tracer);
+
+/** Set pointer to the NTA info structure (from solver) */
+void preprocessor_set_nta_info(preprocessor_t* pre, nta_info_t* nta_info);
 
 /** Set the exception handler */
 void preprocessor_set_exception_handler(preprocessor_t* pre, jmp_buf* handler);

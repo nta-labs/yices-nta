@@ -44,6 +44,16 @@ void mcsat_destruct(mcsat_solver_t* mcsat);
 smt_status_t mcsat_status(const mcsat_solver_t* mcsat);
 
 /*
+ * Return true if any constraint in the trail used delta mode.
+ */
+bool mcsat_delta_used_in_trail(const mcsat_solver_t* mcsat);
+
+/*
+ * Return the configured delta value (0 if unset).
+ */
+int32_t mcsat_get_nta_delta(const mcsat_solver_t* mcsat);
+
+/*
  * Remove all assertions.
  */
 void mcsat_reset(mcsat_solver_t* mcsat);
@@ -141,5 +151,8 @@ void mcsat_gc_mark(mcsat_solver_t* mcsat);
  * Set the exception handler. Should be done before, any call into the solver.
  */
 void mcsat_set_exception_handler(mcsat_solver_t* mcsat, jmp_buf* handler);
+
+/* Set whether to use the period variable for sin abstraction. */
+void mcsat_set_use_period_for_sin(mcsat_solver_t* mcsat, bool use_period_for_sin);
 
 #endif /* MCSAT_SOLVER_H_ */

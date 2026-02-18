@@ -22,6 +22,7 @@
 
 void trail_construct(mcsat_trail_t* trail, const variable_db_t* var_db) {
   trail->var_db = var_db;
+  trail->nta_info = NULL;
   init_ivector(&trail->elements, 0);
   init_ivector(&trail->to_repropagate, 0);
   init_ivector(&trail->level_sizes, 0);
@@ -48,6 +49,7 @@ void init_ivector_copy(ivector_t* v, const ivector_t* from) {
 
 void trail_construct_copy(mcsat_trail_t* trail, const mcsat_trail_t* from) {
   trail->var_db = from->var_db;
+  trail->nta_info = from->nta_info;
   init_ivector_copy(&trail->elements, &from->elements);
   init_ivector_copy(&trail->to_repropagate, &from->to_repropagate);
   init_ivector_copy(&trail->level_sizes, &from->level_sizes);
@@ -68,6 +70,7 @@ void trail_construct_copy(mcsat_trail_t* trail, const mcsat_trail_t* from) {
 
 void trail_destruct(mcsat_trail_t* trail) {
   trail->var_db = NULL;
+  trail->nta_info = NULL;
   delete_ivector(&trail->elements);
   delete_ivector(&trail->to_repropagate);
   delete_ivector(&trail->level_sizes);

@@ -26,6 +26,7 @@
 #endif
 #endif
 
+#include <math.h>
 #include <poly/polynomial.h>
 #include <poly/polynomial_context.h>
 #include <poly/variable_db.h>
@@ -44,17 +45,174 @@
 #include "mcsat/watch_list_manager.h"
 #include "mcsat/na/na_libpoly.h"
 #include "mcsat/na/na_plugin_explain.h"
+#include "mcsat/na/nta_functions.h"
+#include "mcsat/value.h"
 
 #include "terms/terms.h"
+#include "terms/term_manager.h"
+#include "terms/polynomials.h"
 #include "terms/term_explorer.h"
 #include "utils/int_array_sort2.h"
 #include "utils/refcount_strings.h"
 
 #include "api/yices_api_lock_free.h"
 
+typedef struct {
+  int32_t num;
+  int32_t den;
+} rational_pair_t;
+
+static const rational_pair_t INITIAL_PI_VALUE = { 165707065, 52746197 };
+
 static inline
 bool na_plugin_has_assignment(const na_plugin_t* na, variable_t x) {
   return trail_has_value(na->ctx->trail, x) && trail_get_index(na->ctx->trail, x) < na->trail_i;
+}
+
+// TODO_NTA move to nta_functions.c
+static inline
+term_t na_plugin_var_has_sin_term(na_plugin_t* na, variable_t x) {
+  if (na == NULL || na->nta_info == NULL) return NULL_TERM;
+  term_t t = variable_db_get_term(na->ctx->var_db, x);
+  return nta_info_get_sin_term(na->nta_info, t);
+}
+static inline
+term_t na_plugin_var_has_inverse_sin_term(na_plugin_t* na, variable_t x) {
+  if (na == NULL || na->nta_info == NULL) return NULL_TERM;
+  term_t t = variable_db_get_term(na->ctx->var_db, x);
+  return nta_info_get_sin_inverse_term(na->nta_info, t);
+}
+
+static inline
+term_t na_plugin_var_has_period_term(na_plugin_t* na, variable_t x) {
+  if (na == NULL || na->nta_info == NULL) return NULL_TERM;
+  term_t t = variable_db_get_term(na->ctx->var_db, x);
+  if (!na->nta_info->use_period_for_sin) {
+    return NULL_TERM;
+  }
+  return nta_info_get_sin_period_term(na->nta_info, t);
+}
+
+static void na_plugin_add_at_base_level_nta_lemma(na_plugin_t* na, trail_token_t* prop, term_t lemma) {
+  bool lemma_value_bool = true;
+  term_t lemma_atom = lemma;
+  if (is_neg_term(lemma)) {
+    lemma_atom = unsigned_term(lemma);
+    lemma_value_bool = false;
+  }
+
+  variable_t lemma_var = variable_db_get_variable(na->ctx->var_db, lemma_atom);
+  mcsat_value_t lemma_value;
+  mcsat_value_construct_bool(&lemma_value, lemma_value_bool);
+  if (na->nta_info != NULL) {
+    nta_info_add_nta_lemma_variable(na->nta_info, lemma_var);
+  }
+  prop->add_at_level(prop, lemma_var, &lemma_value, na->ctx->trail->decision_level_base);
+  mcsat_value_destruct(&lemma_value);
+}
+
+static inline void na_plugin_track_added_lemma(na_plugin_t* na, variable_t lemma_var) {
+  if (na == NULL || na->nta_info == NULL || lemma_var == variable_null) {
+    return;
+  }
+  nta_info_add_nta_lemma_variable(na->nta_info, lemma_var);
+}
+
+// static void na_plugin_new_term_notify(plugin_t* plugin, term_t t, trail_token_t* prop);
+// static void na_plugin_register_lp_variables_for_term(na_plugin_t* na, term_t t);
+// static bool na_plugin_trail_variable_compare(void* data, variable_t t1, variable_t t2);
+// static void na_plugin_process_fully_assigned_constraint(na_plugin_t* na, trail_token_t* prop, variable_t cstr_var);
+
+static inline void na_plugin_add_nta_lemma(na_plugin_t* na, trail_token_t* prop, term_t lemma) {
+  prop->lemma(prop, lemma);
+  term_t lemma_atom = unsigned_term(lemma);
+  // print debugging info about the lemma
+  if (ctx_trace_enabled(na->ctx, "na::nta")) {
+    ctx_trace_printf(na->ctx, "adding initial nta lemma:\n");
+    //trail_print(na->ctx->trail, ctx_trace_out(na->ctx));
+    ctx_trace_term(na->ctx,lemma);
+  }
+  na_plugin_track_added_lemma(na, variable_db_get_variable(na->ctx->var_db, lemma_atom));
+}
+
+// static
+// void na_plugin_propagate_nta_literal(na_plugin_t* na, trail_token_t* prop, term_t literal) {
+//   term_t literal_atom = unsigned_term(literal);
+//   variable_t literal_var = variable_db_get_variable(na->ctx->var_db, literal_atom);
+
+//   if (!watch_list_manager_has_constraint(&na->wlm, literal_var)) {
+//     int_mset_t t_variables;
+//     int_mset_construct(&t_variables, variable_null);
+//     na_plugin_get_constraint_variables(na, literal_atom, &t_variables);
+
+//     bool is_constraint = t_variables.element_list.size != 1 ||
+//         t_variables.element_list.data[0] != literal_var;
+
+//     if (is_constraint) {
+//       ivector_t* t_variables_list = int_mset_get_list(&t_variables);
+
+//       for (uint32_t i = 0; i < t_variables_list->size; ++ i) {
+//         term_t tt = variable_db_get_term(na->ctx->var_db, t_variables_list->data[i]);
+//         if (!lp_data_variable_has_term(&na->lp_data, tt)) {
+//           lp_data_add_lp_variable(&na->lp_data, na->ctx->terms, tt);
+//         }
+//       }
+
+//       for (uint32_t i = 0; i < t_variables_list->size; ++ i) {
+//         variable_t x = t_variables_list->data[i];
+//         uint32_t deg = int_mset_contains(&t_variables, x);
+//         na->ctx->bump_variable_n(na->ctx, x, deg);
+//       }
+
+//       int_array_sort2(t_variables_list->data, t_variables_list->size,
+//         (void*) na->ctx->trail, na_plugin_trail_variable_compare);
+
+//       variable_list_ref_t var_list = watch_list_manager_new_list(
+//         &na->wlm, t_variables_list->data, t_variables_list->size, literal_var);
+
+//       watch_list_manager_add_to_watch(&na->wlm, var_list, t_variables_list->data[0]);
+//       if (t_variables_list->size > 1) {
+//         watch_list_manager_add_to_watch(&na->wlm, var_list, t_variables_list->data[1]);
+//       }
+
+//       variable_t top_var = t_variables_list->data[0];
+//       constraint_unit_state_t unit_status = CONSTRAINT_UNKNOWN;
+//       if (na_plugin_has_assignment(na, top_var)) {
+//         unit_status = CONSTRAINT_FULLY_ASSIGNED;
+//       } else if (t_variables_list->size == 1) {
+//         unit_status = CONSTRAINT_UNIT;
+//       } else if (na_plugin_has_assignment(na, t_variables_list->data[1])) {
+//         unit_status = CONSTRAINT_UNIT;
+//       }
+
+//       constraint_unit_info_set(&na->unit_info, literal_var,
+//         unit_status == CONSTRAINT_UNIT ? top_var : variable_null, unit_status);
+
+//       na_poly_constraint_add(na, literal_var);
+//       (*na->stats.constraints_attached) ++;
+//     }
+
+//     int_mset_destruct(&t_variables);
+//   }
+
+//   if (trail_has_value(na->ctx->trail, literal_var)) {
+//     return;
+//   }
+
+//   if (!watch_list_manager_has_constraint(&na->wlm, literal_var)) {
+//     return;
+//   }
+
+//   na_plugin_process_fully_assigned_constraint(na, prop, literal_var);
+// }
+
+static inline term_t nta_guard_taylor_lemma(term_t x, term_t two_pi, term_t lemma) {
+  return lemma;
+  // term_t zero = _o_yices_rational32(0, 1);
+  // term_t guard_lo = _o_yices_arith_lt_atom(x, zero);
+  // term_t guard_hi = _o_yices_arith_geq_atom(x, two_pi);
+  // term_t disjuncts[3] = { guard_lo, guard_hi, lemma };
+  // return _o_yices_or(3, disjuncts);
 }
 
 static
@@ -82,6 +240,7 @@ void na_plugin_construct(plugin_t* plugin, plugin_context_t* ctx) {
   // OPTIONS NOT AVAILABLE IN CONSTRUCTOR, THEY ARE SETUP LATER
 
   na->ctx = ctx;
+  na->nta_info = NULL;
   na->last_decided_and_unprocessed = variable_null;
   na->trail_i = 0;
 
@@ -89,6 +248,8 @@ void na_plugin_construct(plugin_t* plugin, plugin_context_t* ctx) {
   na->conflict_variable_int = variable_null;
   na->conflict_variable_assumption = variable_null;
   lp_value_construct_none(&na->conflict_variable_value);
+
+  init_ivector(&na->conflict_refinement_lemmas, 0);
 
   watch_list_manager_construct(&na->wlm, ctx->var_db);
   constraint_unit_info_init(&na->unit_info);
@@ -157,6 +318,7 @@ void na_plugin_destruct(plugin_t* plugin) {
   constraint_unit_info_destruct(&na->unit_info);
 
   delete_ivector(&na->processed_variables);
+  delete_ivector(&na->conflict_refinement_lemmas);
   scope_holder_destruct(&na->scope);
 
   delete_int_hmap(&na->evaluation_value_cache);
@@ -192,6 +354,8 @@ static inline
 bool na_plugin_trail_variable_compare(void *data, variable_t t1, variable_t t2) {
   return trail_variable_compare((const mcsat_trail_t *)data, t1, t2);
 }
+
+static bool na_plugin_check_nta_consistency(na_plugin_t* na, trail_token_t* prop, variable_t constraint_var);
 
 static
 lp_feasibility_set_t* na_plugin_get_feasible_set(na_plugin_t* na, variable_t cstr_var, variable_t cstr_top_var, bool is_negated) {
@@ -362,6 +526,91 @@ void na_plugin_process_fully_assigned_constraint(na_plugin_t* na, trail_token_t*
   }
 }
 
+// static
+// bool na_plugin_assign_evaluated_constraint(na_plugin_t* na, trail_token_t* prop, term_t cstr_term) {
+//   variable_t cstr_var = variable_db_get_variable(na->ctx->var_db, cstr_term);
+//   if (trail_has_value(na->ctx->trail, cstr_var)) {
+//     return true;
+//   }
+
+//   if (!watch_list_manager_has_constraint(&na->wlm, cstr_var)) {
+//     na_plugin_new_term_notify((plugin_t*) na, cstr_term, prop);
+//   }
+
+//   if (trail_has_value(na->ctx->trail, cstr_var)) {
+//     return true;
+//   }
+
+//   if (!watch_list_manager_has_constraint(&na->wlm, cstr_var)) {
+//     return false;
+//   }
+
+//   na_plugin_register_lp_variables_for_term(na, cstr_term);
+//   na_poly_constraint_add(na, cstr_var);
+
+//   if (trail_has_value(na->ctx->trail, cstr_var)) {
+//     return true;
+//   }
+
+//   uint32_t cstr_level = 0;
+//   const mcsat_value_t* cstr_value = na_plugin_constraint_evaluate(na, cstr_var, &cstr_level);
+//   if (cstr_value == NULL) {
+//     return false;
+//   }
+
+//   bool ok = prop->add_at_level(prop, cstr_var, cstr_value, cstr_level);
+//   return ok || trail_has_value(na->ctx->trail, cstr_var);
+// }
+
+// static
+// bool na_plugin_literal_value_in_trail(const na_plugin_t* na, term_t literal, bool* value_out) {
+//   term_t literal_pos = unsigned_term(literal);
+//   variable_t literal_var = variable_db_get_variable_if_exists(na->ctx->var_db, literal_pos);
+//   if (literal_var == variable_null || !trail_has_value(na->ctx->trail, literal_var)) {
+//     return false;
+//   }
+
+//   const mcsat_value_t* value = trail_get_value(na->ctx->trail, literal_var);
+//   if (value->type != VALUE_BOOLEAN) {
+//     return false;
+//   }
+
+//   bool literal_value = value->b;
+//   if (literal != literal_pos) {
+//     literal_value = !literal_value;
+//   }
+
+//   *value_out = literal_value;
+//   return true;
+// }
+
+// static
+// bool na_plugin_literal_is_false_in_trail(const na_plugin_t* na, term_t literal) {
+//   bool literal_value = false;
+//   if (!na_plugin_literal_value_in_trail(na, literal, &literal_value)) {
+//     return false;
+//   }
+
+//   return !literal_value;
+// }
+
+static
+void na_plugin_register_lp_variables_for_term(na_plugin_t* na, term_t t) {
+  int_mset_t t_variables;
+  int_mset_construct(&t_variables, variable_null);
+  na_plugin_get_constraint_variables(na, t, &t_variables);
+
+  ivector_t* t_variables_list = int_mset_get_list(&t_variables);
+  for (uint32_t i = 0; i < t_variables_list->size; ++i) {
+    term_t tt = variable_db_get_term(na->ctx->var_db, t_variables_list->data[i]);
+    if (!lp_data_variable_has_term(&na->lp_data, tt)) {
+      lp_data_add_lp_variable(&na->lp_data, na->ctx->terms, tt);
+    }
+  }
+
+  int_mset_destruct(&t_variables);
+}
+
 static
 void na_plugin_new_term_notify(plugin_t* plugin, term_t t, trail_token_t* prop) {
 
@@ -477,6 +726,472 @@ void na_plugin_new_term_notify(plugin_t* plugin, term_t t, trail_token_t* prop) 
       prop->lemma(prop, tcc);
       delete_ivector(&disjuncts);
     }
+    
+    if (na->nta_info != NULL) {
+      /* Check if t is a key in nta_info->sin_map (i.e., the original argument
+      * of a sin abstraction). If so, add Taylor approximation constraints.
+      */
+      int_hmap_pair_t *p = int_hmap_find(&na->nta_info->sin_map, t);
+      if (p != NULL) {
+        term_t sin_term = (term_t) p->val;
+        bool use_period = na->nta_info->use_period_for_sin;
+
+        /* Get pi and compute adjusted argument if period is enabled */
+        term_t pi_term = nta_info_get_pi(na->nta_info);
+        assert(pi_term != NULL_TERM);
+
+        term_t arg_term = t;
+        term_t two_pi = _o_yices_mul(_o_yices_rational32(2, 1), pi_term);
+        term_t period_term = NULL_TERM;
+        term_t two_pi_period = NULL_TERM;
+        if (use_period) {
+          period_term = nta_info_get_sin_period_term(na->nta_info, t);
+          assert(period_term != NULL_TERM);
+          two_pi_period = _o_yices_mul(two_pi, period_term);
+          arg_term = _o_yices_sub(t, two_pi_period);
+        }
+        
+        if (use_period) {
+          // Constants for period-based lemmas
+          term_t zero_term = _o_yices_rational32(0, 1);
+          term_t one_term = _o_yices_rational32(1, 1);
+          term_t half_term = _o_yices_rational32(1, 2);
+          term_t neg_half_term = _o_yices_rational32(-1, 2);
+          term_t neg_one_term = _o_yices_rational32(-1, 1);
+          term_t half_pi = _o_yices_mul(_o_yices_rational32(1, 2), pi_term);
+          term_t three_halves_pi = _o_yices_mul(_o_yices_rational32(3, 2), pi_term);
+          term_t one_sixth_pi = _o_yices_mul(_o_yices_rational32(1, 6), pi_term);
+          term_t five_sixth_pi = _o_yices_mul(_o_yices_rational32(5, 6), pi_term);
+          term_t seven_sixth_pi = _o_yices_mul(_o_yices_rational32(7, 6), pi_term);
+          term_t eleven_sixth_pi = _o_yices_mul(_o_yices_rational32(11, 6), pi_term);
+
+          // Lemmas for sin values at key points in the period.
+          term_t t_eq_two_pi_period = _o_yices_arith_eq_atom(t, two_pi_period);
+          term_t t_eq_two_pi_period_plus_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi_period, pi_term));
+          term_t t_eq_two_pi_period_plus_half_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi_period, half_pi));
+          term_t t_eq_two_pi_period_plus_three_halves_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi_period, three_halves_pi));
+          term_t t_eq_two_pi_period_plus_one_sixth_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi_period, one_sixth_pi));
+          term_t t_eq_two_pi_period_plus_five_sixth_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi_period, five_sixth_pi));
+
+          term_t t_eq_two_pi_period_plus_seven_sixth_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi_period, seven_sixth_pi));
+          term_t t_eq_two_pi_period_plus_eleven_sixth_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi_period, eleven_sixth_pi));
+
+          term_t sin_eq_zero = _o_yices_arith_eq_atom(sin_term, zero_term);
+          term_t sin_eq_one = _o_yices_arith_eq_atom(sin_term, one_term);
+          term_t sin_eq_neg_one = _o_yices_arith_eq_atom(sin_term, neg_one_term);
+          term_t sin_eq_half = _o_yices_arith_eq_atom(sin_term, half_term);
+          term_t sin_eq_neg_half = _o_yices_arith_eq_atom(sin_term, neg_half_term);
+
+          term_t zero_cases[2] = { t_eq_two_pi_period, t_eq_two_pi_period_plus_pi };
+
+          // sin(x) = 0 iff x = 2*pi*period or x = 2*pi*period + pi
+          term_t lemma_sin_zero = _o_yices_iff(sin_eq_zero, _o_yices_or(2, zero_cases));
+
+          // sin(x) = 1 iff x = 2*pi*period + pi/2
+          term_t lemma_sin_one = _o_yices_iff(sin_eq_one, t_eq_two_pi_period_plus_half_pi);
+
+          // sin(x) = -1 iff x = 2*pi*period + 3*pi/2
+          term_t lemma_sin_neg_one = _o_yices_iff(sin_eq_neg_one, t_eq_two_pi_period_plus_three_halves_pi);
+
+          // sin(x) = 1/2 iff x = 2*pi*period + pi/6 or x = 2*pi*period + 5*pi/6
+          term_t half_cases[2] = { t_eq_two_pi_period_plus_one_sixth_pi, t_eq_two_pi_period_plus_five_sixth_pi };
+          term_t lemma_sin_half = _o_yices_iff(sin_eq_half, _o_yices_or(2, half_cases));
+
+          // sin(x) = -1/2 iff x = 2*pi*period + 7*pi/6 or x = 2*pi*period + 11*pi/6
+          term_t neg_half_cases[2] = { t_eq_two_pi_period_plus_seven_sixth_pi, t_eq_two_pi_period_plus_eleven_sixth_pi };
+          term_t lemma_sin_neg_half = _o_yices_iff(sin_eq_neg_half, _o_yices_or(2, neg_half_cases));
+
+          na_plugin_add_nta_lemma(na, prop, lemma_sin_zero);
+          na_plugin_add_nta_lemma(na, prop, lemma_sin_one);
+          na_plugin_add_nta_lemma(na, prop, lemma_sin_neg_one);
+          na_plugin_add_nta_lemma(na, prop, lemma_sin_half);
+          na_plugin_add_nta_lemma(na, prop, lemma_sin_neg_half);
+
+          // Lemmas for sin values outside key points
+          term_t t_lt_two_pi_period_plus_pi = _o_yices_arith_lt_atom(t, _o_yices_add(two_pi_period, pi_term));
+          term_t two_pi_period_lt_term = _o_yices_arith_lt_atom(two_pi_period, t);
+          term_t two_pi_period_plus_pi_lt_term = _o_yices_arith_lt_atom(_o_yices_add(two_pi_period, pi_term), t);
+          term_t t_lt_two_pi_period_plus_two_pi = _o_yices_arith_lt_atom(t, _o_yices_add(two_pi_period, two_pi));
+
+          term_t sin_lt_zero = _o_yices_arith_lt_atom(sin_term, zero_term);
+          term_t sin_gt_zero = _o_yices_arith_lt_atom(zero_term, sin_term);
+
+          term_t pos_cases[2] = { two_pi_period_lt_term, t_lt_two_pi_period_plus_pi };
+          term_t neg_cases[2] = { two_pi_period_plus_pi_lt_term, t_lt_two_pi_period_plus_two_pi };
+
+          // sin(x) > 0 iff 2*pi*period < x < 2*pi*period + pi
+          term_t lemma_sin_pos = _o_yices_iff(sin_gt_zero, _o_yices_and(2, pos_cases));
+
+          // sin(x) < 0 iff 2*pi*period + pi < x < 2*pi*period + 2*pi
+          term_t lemma_sin_neg = _o_yices_iff(sin_lt_zero, _o_yices_and(2, neg_cases));
+
+          na_plugin_add_nta_lemma(na, prop, lemma_sin_pos);
+          na_plugin_add_nta_lemma(na, prop, lemma_sin_neg);
+        }
+        else{
+          // term_t zero_term = _o_yices_rational32(0, 1);
+          // term_t one_term = _o_yices_rational32(1, 1);
+          // term_t half_term = _o_yices_rational32(1, 2);
+          // term_t neg_half_term = _o_yices_rational32(-1, 2);
+          // term_t neg_one_term = _o_yices_rational32(-1, 1);
+          // term_t half_pi = _o_yices_mul(_o_yices_rational32(1, 2), pi_term);
+          // term_t three_halves_pi = _o_yices_mul(_o_yices_rational32(3, 2), pi_term);
+          // term_t one_sixth_pi = _o_yices_mul(_o_yices_rational32(1, 6), pi_term);
+          // term_t five_sixth_pi = _o_yices_mul(_o_yices_rational32(5, 6), pi_term);
+          // term_t seven_sixth_pi = _o_yices_mul(_o_yices_rational32(7, 6), pi_term);
+          // term_t eleven_sixth_pi = _o_yices_mul(_o_yices_rational32(11, 6), pi_term);
+
+          // term_t t_eq_two_pi = _o_yices_arith_eq_atom(t, two_pi);
+          // term_t t_eq_two_pi_plus_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi, pi_term));
+          // term_t t_eq_two_pi_plus_half_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi, half_pi));
+          // term_t t_eq_two_pi_plus_three_halves_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi, three_halves_pi));
+          // term_t t_eq_two_pi_plus_one_sixth_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi, one_sixth_pi));
+          // term_t t_eq_two_pi_plus_five_sixth_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi, five_sixth_pi));
+          // term_t t_eq_two_pi_plus_seven_sixth_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi, seven_sixth_pi));
+          // term_t t_eq_two_pi_plus_eleven_sixth_pi = _o_yices_arith_eq_atom(t, _o_yices_add(two_pi, eleven_sixth_pi));
+
+          // term_t sin_eq_zero = _o_yices_arith_eq_atom(sin_term, zero_term);
+          // term_t sin_eq_one = _o_yices_arith_eq_atom(sin_term, one_term);
+          // term_t sin_eq_neg_one = _o_yices_arith_eq_atom(sin_term, neg_one_term);
+          // term_t sin_eq_half = _o_yices_arith_eq_atom(sin_term, half_term);
+          // term_t sin_eq_neg_half = _o_yices_arith_eq_atom(sin_term, neg_half_term);
+
+          // // (x = 2*pi or x = 2*pi + pi) => sin(x) = 0
+          // term_t zero_cases[2] = { t_eq_two_pi, t_eq_two_pi_plus_pi };
+          // term_t lemma_sin_zero = _o_yices_implies(_o_yices_or(2, zero_cases), sin_eq_zero);
+
+          // // x = 2*pi + pi/2 => sin(x) = 1
+          // term_t lemma_sin_one = _o_yices_implies(t_eq_two_pi_plus_half_pi, sin_eq_one);
+
+          // // x = 2*pi + 3*pi/2 => sin(x) = -1
+          // term_t lemma_sin_neg_one = _o_yices_implies(t_eq_two_pi_plus_three_halves_pi, sin_eq_neg_one);
+
+          // // (x = 2*pi + pi/6 or x = 2*pi + 5*pi/6) => sin(x) = 1/2
+          // term_t half_cases[2] = { t_eq_two_pi_plus_one_sixth_pi, t_eq_two_pi_plus_five_sixth_pi };
+          // term_t lemma_sin_half = _o_yices_implies(_o_yices_or(2, half_cases), sin_eq_half);
+
+          // // (x = 2*pi + 7*pi/6 or x = 2*pi + 11*pi/6) => sin(x) = -1/2
+          // term_t neg_half_cases[2] = { t_eq_two_pi_plus_seven_sixth_pi, t_eq_two_pi_plus_eleven_sixth_pi };
+          // term_t lemma_sin_neg_half = _o_yices_implies(_o_yices_or(2, neg_half_cases), sin_eq_neg_half);
+
+          // na_plugin_add_nta_lemma(na, prop, lemma_sin_zero);
+          // na_plugin_add_nta_lemma(na, prop, lemma_sin_one);
+          // na_plugin_add_nta_lemma(na, prop, lemma_sin_neg_one);
+          // na_plugin_add_nta_lemma(na, prop, lemma_sin_half);
+          // na_plugin_add_nta_lemma(na, prop, lemma_sin_neg_half);
+        }
+        // else{
+        //   term_t zero_term = _o_yices_rational32(0, 1);
+        //   term_t sin_eq_zero = _o_yices_arith_eq_atom(sin_term, zero_term);
+        //   // sin is multiple of pi
+        //   term_t pi_divides_t = _o_yices_divides_atom(pi_term, t);
+        //   // sin(x) = 0 iff pi divides x
+        //   term_t lemma_sin_zero = _o_yices_iff(sin_eq_zero, pi_divides_t);
+        //   na_plugin_add_nta_lemma(na, prop, lemma_sin_zero);
+        // }
+
+        /* Add Taylor approximation constraints around centers 0, pi/2, pi, and 3*pi/2 */
+        
+        bool disable_0 = false;
+        bool disable_half_pi = false;
+        bool disable_pi = false;
+        bool disable_three_half_pi = false;
+        bool disable_2pi = true;
+        if (!use_period){
+          disable_0 = false;
+          disable_half_pi = false;
+          disable_pi = false;
+          disable_three_half_pi = false;
+          disable_2pi = true;
+        }
+        // /* Center 0: upper and lower */
+        if(!disable_0) {
+          int deg_0_upper = nta_taylor_initial_degree(TAYLOR_CENTER_ZERO, NTA_TAYLOR_POLARITY_UPPER);
+          int deg_0_lower = nta_taylor_initial_degree(TAYLOR_CENTER_ZERO, NTA_TAYLOR_POLARITY_LOWER);
+          term_t poly_0_upper_term = compute_taylor_approximation_of_sin(na, na->ctx->tm, na->nta_info, arg_term, TAYLOR_CENTER_ZERO, deg_0_upper);
+          if (poly_0_upper_term != NULL_TERM) {
+            if(use_period){
+              term_t ineq1 = _o_yices_arith_geq_atom(poly_0_upper_term, sin_term);
+              na_plugin_add_nta_lemma(na, prop, ineq1);
+            }
+            else {
+              term_t ineq1_geq = _o_yices_arith_geq_atom(poly_0_upper_term, sin_term);
+              term_t ineq1_leq = _o_yices_arith_leq_atom(poly_0_upper_term, sin_term);
+              term_t t_geq_zero = _o_yices_arith_geq_atom(arg_term, _o_yices_rational32(0, 1));
+              term_t t_leq_zero = _o_yices_arith_leq_atom(arg_term, _o_yices_rational32(0, 1));
+              term_t lemma_upper_right = _o_yices_implies(t_geq_zero, ineq1_geq);
+              term_t lemma_lower_left = _o_yices_implies(t_leq_zero, ineq1_leq);
+              na_plugin_add_nta_lemma(na, prop, lemma_upper_right);
+              na_plugin_add_nta_lemma(na, prop, lemma_lower_left);
+            }
+          }
+          term_t poly_0_lower_term = compute_taylor_approximation_of_sin(na, na->ctx->tm, na->nta_info, arg_term, TAYLOR_CENTER_ZERO, deg_0_lower);
+          if (poly_0_lower_term != NULL_TERM) {
+            if(use_period){
+            term_t ineq2 = _o_yices_arith_geq_atom(sin_term, poly_0_lower_term);
+              na_plugin_add_nta_lemma(na, prop, ineq2);
+            }
+            else {
+              term_t ineq2_geq = _o_yices_arith_geq_atom(sin_term, poly_0_lower_term);
+              term_t ineq2_leq = _o_yices_arith_leq_atom(sin_term, poly_0_lower_term);
+
+              term_t t_geq_zero = _o_yices_arith_geq_atom(arg_term, _o_yices_rational32(0, 1));
+              term_t t_leq_zero = _o_yices_arith_leq_atom(arg_term, _o_yices_rational32(0, 1));
+              term_t lemma_lower_right = _o_yices_implies(t_geq_zero, ineq2_geq);
+              term_t lemma_upper_left = _o_yices_implies(t_leq_zero, ineq2_leq);
+              na_plugin_add_nta_lemma(na, prop, lemma_lower_right);
+              na_plugin_add_nta_lemma(na, prop, lemma_upper_left);
+            }
+          }
+        }
+          
+        /* Center pi/2: upper and lower */
+        if(!disable_half_pi) {
+          int deg_pi2_upper = nta_taylor_initial_degree(TAYLOR_CENTER_PI_2, NTA_TAYLOR_POLARITY_UPPER);
+          int deg_pi2_lower = nta_taylor_initial_degree(TAYLOR_CENTER_PI_2, NTA_TAYLOR_POLARITY_LOWER);
+          term_t poly_pi2_upper_term = compute_taylor_approximation_of_sin(na, na->ctx->tm, na->nta_info, arg_term, TAYLOR_CENTER_PI_2, deg_pi2_upper);
+          if (poly_pi2_upper_term != NULL_TERM) {
+            term_t ineq3 = _o_yices_arith_geq_atom(poly_pi2_upper_term, sin_term);
+            if (!use_period) {
+              // ineq3 = nta_guard_taylor_lemma(t, two_pi, ineq3);
+            }
+            na_plugin_add_nta_lemma(na, prop, ineq3);
+          }
+          term_t poly_pi2_lower_term = compute_taylor_approximation_of_sin(na, na->ctx->tm, na->nta_info, arg_term, TAYLOR_CENTER_PI_2, deg_pi2_lower);
+          if (poly_pi2_lower_term != NULL_TERM) {
+            term_t ineq4 = _o_yices_arith_geq_atom(sin_term, poly_pi2_lower_term);
+            if (!use_period) {
+              // ineq4 = nta_guard_taylor_lemma(t, two_pi, ineq4);
+            }
+            na_plugin_add_nta_lemma(na, prop, ineq4);
+          }
+        }
+        
+        /* Center pi: upper and lower */
+        if(!disable_pi) {
+          term_t arg_leq_pi = _o_yices_arith_leq_atom(arg_term, pi_term);
+          term_t arg_geq_pi = _o_yices_arith_geq_atom(arg_term, pi_term);
+          int deg_pi_upper = nta_taylor_initial_degree(TAYLOR_CENTER_PI, NTA_TAYLOR_POLARITY_UPPER);
+          int deg_pi_lower = nta_taylor_initial_degree(TAYLOR_CENTER_PI, NTA_TAYLOR_POLARITY_LOWER);
+          // upper bound on left ; lower bound on right
+          term_t poly_pi_upper_polarity_term = compute_taylor_approximation_of_sin(na, na->ctx->tm, na->nta_info, arg_term, TAYLOR_CENTER_PI, deg_pi_upper);
+          // upper bound on right; lower bound on left
+          term_t poly_pi_lower_polarity_term = compute_taylor_approximation_of_sin(na, na->ctx->tm, na->nta_info, arg_term, TAYLOR_CENTER_PI, deg_pi_lower);
+          assert(poly_pi_upper_polarity_term != NULL_TERM && poly_pi_lower_polarity_term != NULL_TERM);
+
+          // arg <= pi  ==>  poly_upper_polarity >= sin_term
+          term_t lemma_upper_left = _o_yices_implies(arg_leq_pi, _o_yices_arith_geq_atom(poly_pi_upper_polarity_term, sin_term));
+          // arg >= pi  ==>  poly_upper_polarity <= sin_term
+          term_t lemma_upper_right = _o_yices_implies(arg_geq_pi, _o_yices_arith_leq_atom(poly_pi_upper_polarity_term, sin_term));
+          // arg <= pi  ==>  poly_lower_polarity <= sin_term
+          term_t lemma_lower_left = _o_yices_implies(arg_leq_pi, _o_yices_arith_leq_atom(poly_pi_lower_polarity_term, sin_term));
+          // arg >= pi  ==>  poly_lower_polarity >= sin_term
+          term_t lemma_lower_right = _o_yices_implies(arg_geq_pi, _o_yices_arith_geq_atom(poly_pi_lower_polarity_term, sin_term));
+
+          if (!use_period) {
+            // lemma_upper_left = nta_guard_taylor_lemma(t, two_pi, lemma_upper_left);
+            // lemma_upper_right = nta_guard_taylor_lemma(t, two_pi, lemma_upper_right);
+            // lemma_lower_left = nta_guard_taylor_lemma(t, two_pi, lemma_lower_left);
+            // lemma_lower_right = nta_guard_taylor_lemma(t, two_pi, lemma_lower_right);
+          }
+
+
+          na_plugin_add_nta_lemma(na, prop, lemma_upper_left);
+          na_plugin_add_nta_lemma(na, prop, lemma_upper_right);
+          na_plugin_add_nta_lemma(na, prop, lemma_lower_left);
+          na_plugin_add_nta_lemma(na, prop, lemma_lower_right);
+          
+        }
+
+        /* Center 3*pi/2: upper and lower */
+        if(!disable_three_half_pi) {
+          int deg_pi3_2_upper = nta_taylor_initial_degree(TAYLOR_CENTER_PI_3_2, NTA_TAYLOR_POLARITY_UPPER);
+          int deg_pi3_2_lower = nta_taylor_initial_degree(TAYLOR_CENTER_PI_3_2, NTA_TAYLOR_POLARITY_LOWER);
+          term_t poly_pi3_2_upper_term = compute_taylor_approximation_of_sin(na, na->ctx->tm, na->nta_info, arg_term, TAYLOR_CENTER_PI_3_2, deg_pi3_2_upper);
+          if (poly_pi3_2_upper_term != NULL_TERM) {
+            term_t ineq8 = _o_yices_arith_geq_atom(poly_pi3_2_upper_term, sin_term);
+            if (!use_period) {
+              // ineq8 = nta_guard_taylor_lemma(t, two_pi, ineq8);
+            }
+            na_plugin_add_nta_lemma(na, prop, ineq8);
+          }
+          term_t poly_pi3_2_lower_term = compute_taylor_approximation_of_sin(na, na->ctx->tm, na->nta_info, arg_term, TAYLOR_CENTER_PI_3_2, deg_pi3_2_lower);
+          if (poly_pi3_2_lower_term != NULL_TERM) {
+            term_t ineq7 = _o_yices_arith_geq_atom(sin_term, poly_pi3_2_lower_term);
+            if (!use_period) {
+              // ineq7 = nta_guard_taylor_lemma(t, two_pi, ineq7);
+            }
+            na_plugin_add_nta_lemma(na, prop, ineq7);
+          }
+          
+          if (ctx_trace_enabled(na->ctx, "na::new_term")) {
+            ctx_trace_printf(na->ctx, "na_plugin_new_term_notify: added Taylor approximation lemmas for sin_term\n");
+          }
+        }
+
+        /* Center 2*pi: upper and lower */
+        if(!disable_2pi) {
+          int deg_2pi_upper = nta_taylor_initial_degree(TAYLOR_CENTER_2_PI, NTA_TAYLOR_POLARITY_UPPER);
+          int deg_2pi_lower = nta_taylor_initial_degree(TAYLOR_CENTER_2_PI, NTA_TAYLOR_POLARITY_LOWER);
+          term_t poly_2pi_upper_term = compute_taylor_approximation_of_sin(na, na->ctx->tm, na->nta_info, arg_term, TAYLOR_CENTER_2_PI, deg_2pi_upper);
+          if (poly_2pi_upper_term != NULL_TERM) {
+            term_t ineq9 = _o_yices_arith_geq_atom(poly_2pi_upper_term, sin_term);
+            if (!use_period) {
+              // ineq9 = nta_guard_taylor_lemma(t, two_pi, ineq9);
+            }
+            na_plugin_add_nta_lemma(na, prop, ineq9);
+          }
+          term_t poly_2pi_lower_term = compute_taylor_approximation_of_sin(na, na->ctx->tm, na->nta_info, arg_term, TAYLOR_CENTER_2_PI, deg_2pi_lower);
+          if (poly_2pi_lower_term != NULL_TERM) {
+            term_t ineq10 = _o_yices_arith_geq_atom(sin_term, poly_2pi_lower_term);
+            if (!use_period) {
+              // ineq10 = nta_guard_taylor_lemma(t, two_pi, ineq10);
+            }
+            na_plugin_add_nta_lemma(na, prop, ineq10);
+          }
+        }
+      }
+
+      /* If t is the argument of an exp abstraction, add Padé-based lemmas around center 0. */
+      int_hmap_pair_t *exp_pair = int_hmap_find(&na->nta_info->exp_map, t);
+      if (exp_pair != NULL) {
+        term_t exp_term = (term_t) exp_pair->val;
+        term_t zero_term = _o_yices_rational32(0, 1);
+        mcsat_value_t zero_val;
+        mcsat_value_construct_from_constant_term(&zero_val, terms, zero_term);
+
+        term_t lemmas[2];
+        term_t main_literals[2];
+
+        bool ok_lower = refine_approximation_of_exp_with_pade(na, na->ctx->tm, t, exp_term,
+                          &zero_val, false,
+                          lemmas, main_literals);
+        if (ok_lower) {
+          for (i = 0; i < 2; i++) {
+            if (lemmas[i] != NULL_TERM) {
+              na_plugin_add_nta_lemma(na, prop, lemmas[i]);
+            }
+          }
+        }
+
+        bool ok_upper = refine_approximation_of_exp_with_pade(na, na->ctx->tm, t, exp_term,
+                          &zero_val, true,
+                          lemmas, main_literals);
+        if (ok_upper) {
+          for (i = 0; i < 2; i++) {
+            if (lemmas[i] != NULL_TERM) {
+              na_plugin_add_nta_lemma(na, prop, lemmas[i]);
+            }
+          }
+        }
+
+        mcsat_value_destruct(&zero_val);
+
+        if (ctx_trace_enabled(na->ctx, "na::new_term")) {
+          ctx_trace_printf(na->ctx, "na_plugin_new_term_notify: added Padé exp lemmas for argument\n");
+        }
+      }
+      /* Check if t is pi, i.e. nta_info->pi. If so, add initial bounds.
+      */
+      if( t == nta_info_get_pi(na->nta_info) ) {
+        /* Add lemmas: 165707064/52746197 <= pi <= 165707066/52746197 */
+        /* Recall: INITIAL_PI_VALUE = { 165707065, 52746197 }; */
+        term_t lower_bound = _o_yices_rational32(165707064, 52746197);
+        term_t upper_bound = _o_yices_rational32(165707066, 52746197);
+        
+        term_t ineq1 = _o_yices_arith_geq_atom(t, lower_bound);
+        term_t ineq2 = _o_yices_arith_geq_atom(upper_bound, t);
+        
+        na_plugin_add_nta_lemma(na, prop, ineq1);
+        na_plugin_add_nta_lemma(na, prop, ineq2);
+        
+        if (ctx_trace_enabled(na->ctx, "na::new_term")) {
+          ctx_trace_printf(na->ctx, "na_plugin_new_term_notify: added initial bounds for pi\n");
+        }
+      }
+
+      /* If t is the abstraction sin(x) we ensure -1 <= sin(x) <= 1 */
+      term_t sin_arg = nta_info_get_sin_inverse_term(na->nta_info, t);
+      if (sin_arg != NULL_TERM && nta_info_get_sin_term(na->nta_info, sin_arg) == t) {
+        term_t sin_lower = _o_yices_arith_leq_atom(_o_yices_neg(_o_yices_int32(1)), t);
+        term_t sin_upper = _o_yices_arith_leq_atom(t, _o_yices_int32(1));
+        na_plugin_add_at_base_level_nta_lemma(na, prop, sin_lower);
+        na_plugin_add_at_base_level_nta_lemma(na, prop, sin_upper);
+        if (ctx_trace_enabled(na->ctx, "na::new_term")) {
+          ctx_trace_printf(na->ctx, "na_plugin_new_term_notify: added sin bounds for abstraction\n");
+        }
+      }
+
+      if (na->nta_info->use_period_for_sin) {
+        /* If t is the abstraction period i for sin(x) ensure 2pi*i <= x and x < 2pi*(i+1) */
+        term_t period_arg = nta_info_get_sin_period_inverse_term(na->nta_info, t);
+        if (period_arg != NULL_TERM && nta_info_get_sin_period_term(na->nta_info, period_arg) == t) {
+          term_t pi_term = nta_info_get_pi(na->nta_info);
+          if (pi_term != NULL_TERM) {
+            term_t two = _o_yices_int32(2);
+            term_t period_lower = _o_yices_arith_leq_atom(_o_yices_mul(two, _o_yices_mul(pi_term, t)), period_arg);
+            term_t period_upper = _o_yices_arith_lt_atom(period_arg, _o_yices_mul(two, _o_yices_mul(pi_term, _o_yices_add(t, _o_yices_int32(1)))));
+            na_plugin_add_nta_lemma(na, prop, period_lower);
+            na_plugin_add_nta_lemma(na, prop, period_upper);
+            if (ctx_trace_enabled(na->ctx, "na::new_term")) {
+              ctx_trace_printf(na->ctx, "na_plugin_new_term_notify: added period bounds for abstraction\n");
+              // print the terms
+              ctx_trace_term(na->ctx, period_lower);
+              ctx_trace_term(na->ctx, period_upper);
+            }
+          }
+        }
+      }
+
+      /* If t is the abstraction exp(x), add basic exp lemmas */
+      term_t exp_arg = nta_info_get_exp_inverse_term(na->nta_info, t);
+      if (exp_arg != NULL_TERM && nta_info_get_exp_term(na->nta_info, exp_arg) == t) {
+        term_t zero_term = _o_yices_rational32(0, 1);
+        term_t one_term = _o_yices_rational32(1, 1);
+        term_t exp_pos = _o_yices_arith_gt_atom(t, zero_term);
+        term_t exp_zero_iff = _o_yices_iff(_o_yices_arith_eq_atom(exp_arg, zero_term),
+                                           _o_yices_arith_eq_atom(t, one_term));
+        term_t x_gt_zero = _o_yices_arith_gt_atom(exp_arg, zero_term);
+
+        term_t center0_term = zero_term;
+        term_t center2_term = _o_yices_rational32(2, 1);
+        term_t center3_term = _o_yices_rational32(3, 1);
+
+        mcsat_value_t center0_val;
+        mcsat_value_t center2_val;
+        mcsat_value_t center3_val;
+        mcsat_value_construct_from_constant_term(&center0_val, terms, center0_term);
+        mcsat_value_construct_from_constant_term(&center2_val, terms, center2_term);
+        mcsat_value_construct_from_constant_term(&center3_val, terms, center3_term);
+
+        term_t taylor_c0_deg1 = compute_taylor_approximation_of_exp(na, na->ctx->tm, exp_arg, &center0_val, 1);
+        // term_t taylor_c2_deg3 = compute_taylor_approximation_of_exp(na, na->ctx->tm, exp_arg, &center2_val, 3);
+        // term_t taylor_c3_deg3 = compute_taylor_approximation_of_exp(na, na->ctx->tm, exp_arg, &center3_val, 3);
+
+        na_plugin_add_nta_lemma(na, prop, exp_pos);
+        na_plugin_add_nta_lemma(na, prop, exp_zero_iff);
+
+        if (taylor_c0_deg1 != NULL_TERM) {
+          term_t exp_gt_taylor = _o_yices_arith_gt_atom(t, taylor_c0_deg1);
+          na_plugin_add_nta_lemma(na, prop, _o_yices_implies(x_gt_zero, exp_gt_taylor));
+        }
+        // if (taylor_c2_deg3 != NULL_TERM) {
+        //   term_t exp_gt_taylor = _o_yices_arith_gt_atom(t, taylor_c2_deg3);
+        //   na_plugin_add_nta_lemma(na, prop, _o_yices_implies(x_gt_zero, exp_gt_taylor));
+        // }
+        // if (taylor_c3_deg3 != NULL_TERM) {
+        //   term_t exp_gt_taylor = _o_yices_arith_gt_atom(t, taylor_c3_deg3);
+        //   na_plugin_add_nta_lemma(na, prop, _o_yices_implies(x_gt_zero, exp_gt_taylor));
+        // }
+
+        mcsat_value_destruct(&center0_val);
+        mcsat_value_destruct(&center2_val);
+        mcsat_value_destruct(&center3_val);
+        if (ctx_trace_enabled(na->ctx, "na::new_term")) {
+          ctx_trace_printf(na->ctx, "na_plugin_new_term_notify: added exp bounds for abstraction\n");
+        }
+      }
+    }
     break;
   }
   default:
@@ -562,10 +1277,19 @@ void na_plugin_new_term_notify(plugin_t* plugin, term_t t, trail_token_t* prop) 
     // Add the constraint to the database
     na_poly_constraint_add(na, t_var);
 
-    // Propagate if fully assigned
-    if (unit_status == CONSTRAINT_FULLY_ASSIGNED) {
-      na_plugin_process_fully_assigned_constraint(na, prop, t_var);
-    }
+     if (unit_status == CONSTRAINT_FULLY_ASSIGNED) {
+      if (ctx_trace_enabled(na->ctx, "na::propagate")) {
+        // TODO_NTA maybe consistency check not needed here?
+        ctx_trace_printf(na->ctx, "CONSTRAINT_FULLY_ASSIGNED (new_term_notify)\n");
+        // print the term
+        ctx_trace_term(na->ctx, t);
+      }
+        na_plugin_process_fully_assigned_constraint(na, prop, t_var);
+        bool conflict_triggered = na_plugin_check_nta_consistency(na, prop, t_var);
+        if (conflict_triggered) {
+          return;  // Stop processing after conflict
+        }
+     }
 
     // Stats
     (*na->stats.constraints_attached) ++;
@@ -759,7 +1483,9 @@ void na_plugin_process_unit_constraint(na_plugin_t* na, trail_token_t* prop, var
     lp_feasibility_set_t* constraint_feasible = na_plugin_get_feasible_set(na, constraint_var, x, is_negated);
 
     if (ctx_trace_enabled(na->ctx, "na::propagate")) {
-      ctx_trace_printf(na->ctx, "na: constraint_feasible = ");
+      ctx_trace_printf(na->ctx, "na: constraint_feasible for variable ");
+      ctx_trace_term(na->ctx, variable_db_get_term(na->ctx->var_db, x));
+      ctx_trace_printf(na->ctx, " : ");
       lp_feasibility_set_print(constraint_feasible, ctx_trace_out(na->ctx));
       ctx_trace_printf(na->ctx, "\n");
     }
@@ -849,6 +1575,129 @@ void na_plugin_process_unit_constraint(na_plugin_t* na, trail_token_t* prop, var
     }
     lp_value_destruct(&x_value);
   }
+}
+
+static bool na_plugin_check_nta_consistency(na_plugin_t* na, trail_token_t* prop, variable_t constraint_var) {
+  const mcsat_trail_t* trail = na->ctx->trail;
+  bool is_nta = na->nta_info != NULL && nta_info_is_nta(na->nta_info);
+  bool is_nta_lemma = na->nta_info != NULL && nta_info_has_nta_lemma_variable(na->nta_info, constraint_var);
+  bool is_original_atom = false;
+  bool is_nta_arg_eq = false;
+  if (na->nta_info != NULL) {
+    term_t constraint_term = variable_db_get_term(na->ctx->var_db, constraint_var);
+    term_t constraint_atom = unsigned_term(constraint_term);
+    is_original_atom = int_hset_member(&na->nta_info->original_atoms, constraint_atom);
+    is_nta_arg_eq = nta_info_is_arg_equation(na->nta_info, constraint_atom);
+  }
+  bool nta_consistent = true;
+  bool conflict_triggered = false;
+
+  if (!is_nta) {
+    if (ctx_trace_enabled(na->ctx, "na::nta")) {
+      ctx_trace_printf(na->ctx, "\tskipping consistency check (NRA: no sin/pi detected) for constraint var %d\n", constraint_var);
+    }
+    return false;
+  }
+
+  // print trace that if nta lemma we are skipping consistency check
+  if (ctx_trace_enabled(na->ctx, "na::nta")) {
+    // print if is nta lemma, original atom, nta arg eq (showing True/False for each)
+    ctx_trace_printf(na->ctx, "is nta lemma: %s, is original atom: %s, is nta arg eq: %s\n",
+      is_nta_lemma ? "True" : "False",
+      is_original_atom ? "True" : "False",
+      is_nta_arg_eq ? "True" : "False");
+
+    if (is_nta_lemma) {
+      ctx_trace_printf(na->ctx, "\tskipping consistency check for nta lemma constraint var %d\n", constraint_var);
+    }
+    if (is_nta_arg_eq) {
+      ctx_trace_printf(na->ctx, "\tskipping consistency check for arg abstraction equation constraint var %d\n", constraint_var);
+    }
+    if (!is_original_atom) {
+      ctx_trace_printf(na->ctx, "\tskipping consistency check for non original atom constraint var %d\n", constraint_var);
+    }
+    // if (!trail_is_consistent(trail)) {
+    //   ctx_trace_printf(na->ctx, "\tskipping consistency check for var %d since trail is inconsistent\n", constraint_var);
+    // }
+  }
+
+  assert(trail_is_consistent(trail));
+  bool has_value_in_trail = trail_has_value(trail, constraint_var);
+
+  if (!is_nta_lemma && !is_nta_arg_eq && is_original_atom && has_value_in_trail && trail_is_consistent(trail)) {
+    nta_consistent = nta_consistency_check(na, prop, constraint_var);
+  }
+  
+
+  if (!nta_consistent) {
+    // Generate refinement lemmas
+    ivector_t refinements;
+    ivector_t refinement_literals;
+    init_ivector(&refinements, 4);
+    init_ivector(&refinement_literals, 4);
+    variable_t conflict_var = nta_refine_abstraction(na, constraint_var, &refinements, &refinement_literals);
+
+    // Store refinement lemmas for conflict explanation
+    ivector_reset(&na->conflict_refinement_lemmas);
+
+    // Add all refinement lemmas (they will cause conflict)
+    mcsat_value_t true_value;
+    mcsat_value_t false_value;
+    mcsat_value_construct_bool(&true_value, true);
+    mcsat_value_construct_bool(&false_value, false);
+    for (uint32_t i = 0; i < refinements.size; i++) {
+      variable_t refinement_var = variable_db_get_variable(na->ctx->var_db, refinements.data[i]);
+      na_plugin_track_added_lemma(na, refinement_var);
+      na_plugin_register_lp_variables_for_term(na, refinements.data[i]);
+      prop->add_at_level(prop, refinement_var, &true_value, na->ctx->trail->decision_level_base);
+      //prop->lemma(prop, refinement_var);
+    }
+    mcsat_value_destruct(&true_value);
+
+    // Record only refinement literals for conflict analysis
+    for (uint32_t i = 0; i < refinement_literals.size; i++) {
+      term_t refinement_literal = refinement_literals.data[i];
+      // if (na_plugin_assign_evaluated_constraint(na, prop, refinement_literal) &&
+      //     na_plugin_literal_is_false_in_trail(na, refinement_literal)) {
+      //   ivector_push(&na->conflict_refinement_lemmas, refinement_literal);
+      // }
+      //na_plugin_propagate_nta_literal(na, prop, refinement_literal);
+      variable_t refinement_literal_var = variable_db_get_variable(na->ctx->var_db, refinement_literals.data[i]);
+      na_plugin_track_added_lemma(na, refinement_literal_var);
+      na_plugin_register_lp_variables_for_term(na, refinement_literals.data[i]);
+      prop->add_at_level(prop, refinement_literal_var, &true_value, na->ctx->trail->decision_level_base);
+  
+      ivector_push(&na->conflict_refinement_lemmas, refinement_literal);
+    }
+    delete_ivector(&refinements);
+    delete_ivector(&refinement_literals);
+
+    // Set the conflict variable (a real-valued sin variable) and signal conflict
+    if (conflict_var != variable_null) {
+      // Register refinement lemmas in poly_constraint_db and feasible_set_db
+      ivector_t lemma_constraint_vars;
+      init_ivector(&lemma_constraint_vars, na->conflict_refinement_lemmas.size);
+      for (uint32_t i = 0; i < na->conflict_refinement_lemmas.size; i++) {
+        term_t lemma_term = na->conflict_refinement_lemmas.data[i];
+        variable_t lemma_var = variable_db_get_variable(na->ctx->var_db, lemma_term);
+
+        // Create and register poly_constraint if not already registered
+        if (!poly_constraint_db_has(na->constraint_db, lemma_var)) {
+          poly_constraint_t* lemma_poly_cstr = na_poly_constraint_create(na, lemma_var);
+          poly_constraint_db_add_constraint(na->constraint_db, lemma_var, lemma_poly_cstr);
+        }
+
+        ivector_push(&lemma_constraint_vars, lemma_var);
+      }
+
+      delete_ivector(&lemma_constraint_vars);
+
+      na->conflict_variable = conflict_var;
+      prop->conflict(prop);
+      conflict_triggered = true;
+    }
+  }
+  return conflict_triggered;
 }
 
 /**
@@ -963,9 +1812,25 @@ void na_plugin_process_variable_assignment(na_plugin_t* na, trail_token_t* prop,
       } else {
         // Fully assigned
         constraint_unit_info_set(&na->unit_info, constraint_var, variable_null, CONSTRAINT_FULLY_ASSIGNED);
+        
+        if (ctx_trace_enabled(na->ctx, "na::propagate")) {
+          ctx_trace_printf(na->ctx, "CONSTRAINT_FULLY_ASSIGNED (process_variable_assignment)\n");
+          // print the constraint
+          ctx_trace_term(na->ctx, variable_db_get_term(na->ctx->var_db, constraint_var));
+          // print trail is consistent
+          ctx_trace_printf(na->ctx, "trail_is_consistent(trail) = %d\n", trail_is_consistent(trail));
+          // print trail has value
+          ctx_trace_printf(na->ctx, "trail_has_value(trail, constraint_var) = %d\n", trail_has_value(trail, constraint_var));
+        }
         // Evaluate the constraint and propagate (if not assigned already)
         if (trail_is_consistent(trail) && !trail_has_value(trail, constraint_var)) {
           na_plugin_process_fully_assigned_constraint(na, prop, constraint_var);
+        }
+        if (trail_is_consistent(trail) && trail_has_value(trail, constraint_var)) {
+          bool conflict_triggered = na_plugin_check_nta_consistency(na, prop, constraint_var);
+          if (conflict_triggered) {
+            return;
+          }
         }
       }
       // Keep the watch
@@ -975,6 +1840,67 @@ void na_plugin_process_variable_assignment(na_plugin_t* na, trail_token_t* prop,
 
   // Done, destruct the iterator
   remove_iterator_destruct(&it);
+
+  // Process any constraints waiting on this variable in the NTA watchlist
+  if (na->nta_info != NULL) {
+    term_t var_term = variable_db_get_term(na->ctx->var_db, var);
+    const ivector_t* pending = nta_info_watchlist_get(na->nta_info, var_term);
+    if (pending != NULL && pending->size > 0) {
+      if (ctx_trace_enabled(na->ctx, "na::nta")) {
+        ctx_trace_printf(na->ctx,
+                         "na_plugin_process_variable_assignment: watchlist pending for term %d (",
+                         var_term);
+        ctx_trace_term(na->ctx, var_term);
+        ctx_trace_printf(na->ctx, ") (size=%u)\n", pending->size);
+      }
+      if (!trail_is_consistent(trail)) {
+        if (ctx_trace_enabled(na->ctx, "na::nta")) {
+          ctx_trace_printf(na->ctx,
+                            "\t skipping (trail inconsistent)\n");
+        }
+        return;
+      }
+      for (uint32_t i = 0; i < pending->size; i++) {
+        variable_t constraint_var = pending->data[i];
+        if (!trail_has_value(trail, constraint_var)) {
+          if (ctx_trace_enabled(na->ctx, "na::nta")) {
+            ctx_trace_printf(na->ctx,
+                             "na_plugin_process_variable_assignment: skip constraint %d (no value in trail)\n",
+                             constraint_var);
+          }
+          continue;
+        }
+        if (constraint_unit_info_get(&na->unit_info, constraint_var) != CONSTRAINT_FULLY_ASSIGNED) {
+          if (ctx_trace_enabled(na->ctx, "na::nta")) {
+            ctx_trace_printf(na->ctx,
+                             "na_plugin_process_variable_assignment: skip constraint %d (not fully assigned)\n",
+                             constraint_var);
+          }
+          continue;
+        }
+        if (ctx_trace_enabled(na->ctx, "na::nta")) {
+          ctx_trace_printf(na->ctx,
+                           "na_plugin_process_variable_assignment: checking constraint %d from watchlist\n",
+                           constraint_var);
+        }
+        bool conflict_triggered = na_plugin_check_nta_consistency(na, prop, constraint_var);
+        if (conflict_triggered) {
+          if (na->nta_info != NULL) {
+            //nta_info_watchlist_clear(na->nta_info, var_term);
+          }
+          return;
+        }
+      }
+    }
+    if (ctx_trace_enabled(na->ctx, "na::nta")) {
+      ctx_trace_printf(na->ctx,
+                       "na_plugin_process_variable_assignment: clearing watchlist for term %d (",
+                       var_term);
+      ctx_trace_term(na->ctx, var_term);
+      ctx_trace_printf(na->ctx, ")\n");
+    }
+    //nta_info_watchlist_clear(na->nta_info, var_term);
+  }
 }
 
 #ifndef NDEBUG
@@ -1070,7 +1996,17 @@ void na_plugin_propagate(plugin_t* plugin, trail_token_t* prop) {
         na_plugin_infer_bounds_from_constraint(na, prop, var);
         break;
       case CONSTRAINT_FULLY_ASSIGNED:
-        // Do nothing
+        if (ctx_trace_enabled(na->ctx, "na::propagate")) {
+          ctx_trace_printf(na->ctx, "CONSTRAINT_FULLY_ASSIGNED (propagate)\n");
+          // print the constraint
+          ctx_trace_term(na->ctx, variable_db_get_term(na->ctx->var_db, var));
+        }
+        if (na_plugin_check_nta_consistency(na, prop, var)) {
+          return;  // Stop processing after conflict
+        }
+
+        
+        //Do nothing
         break;
       }
     }
@@ -1101,6 +2037,9 @@ void na_plugin_decide(plugin_t* plugin, variable_t x, trail_token_t* decide_toke
     } else {
       ctx_trace_printf(na->ctx, "feasible : ALL\n");
     }
+    // if (na_plugin_var_has_sin_term(na, x) != NULL_TERM) {
+    //   ctx_trace_printf(na->ctx, "variable has associated sin term\n");
+    // }
   }
 
   // Pick a value from the set
@@ -1110,18 +2049,43 @@ void na_plugin_decide(plugin_t* plugin, variable_t x, trail_token_t* decide_toke
   lp_value_construct(&x_new_lpvalue, LP_VALUE_RATIONAL, &x_value_default);
   lp_rational_destruct(&x_value_default);
 
+  bool force_pi_value = false;
+  if (na->nta_info != NULL) {
+    term_t pi_term = nta_info_get_pi(na->nta_info);
+    if (pi_term != NULL_TERM) {
+      variable_t pi_var = variable_db_get_variable(na->ctx->var_db, pi_term);
+      if (x == pi_var) {
+        lp_rational_t pi_rational;
+        lp_rational_construct_from_int(&pi_rational, INITIAL_PI_VALUE.num, INITIAL_PI_VALUE.den);
+        lp_value_t pi_value;
+        lp_value_construct(&pi_value, LP_VALUE_RATIONAL, &pi_rational);
+        if (lp_feasibility_set_contains(feasible, &pi_value)) {
+          lp_value_assign(&x_new_lpvalue, &pi_value);
+          force_pi_value = true;
+        }
+        lp_value_destruct(&pi_value);
+        lp_rational_destruct(&pi_rational);
+      }
+    }
+  }
+
   // See if the cached value fits
   bool using_cached = false;
   const mcsat_value_t* x_cached_value = NULL;
-  if (trail_has_cached_value(na->ctx->trail, x)) {
+  if (!force_pi_value && trail_has_cached_value(na->ctx->trail, x)) {
     x_cached_value = trail_get_cached_value(na->ctx->trail, x);
+    //ctx_trace_printf(na->ctx, "\thas cached value\n");
+    //mcsat_value_print(x_cached_value, ctx_trace_out(na->ctx));
+    //ctx_trace_printf(na->ctx, "\tlp_feasibility_set_contains(feasible, &x_cached_value->lp_value)%d\n",lp_feasibility_set_contains(feasible, &x_cached_value->lp_value));
+    
     if (feasible == NULL || lp_feasibility_set_contains(feasible, &x_cached_value->lp_value)) {
       using_cached = true;
+      //ctx_trace_printf(na->ctx, "\tusing cache\n");
     }
   }
 
   // If the set is 0, we can pick any value, including 0
-  if (!using_cached && feasible != NULL) {
+  if (!force_pi_value && !using_cached && feasible != NULL) {
     // Otherwise pick from the set
     lp_feasibility_set_pick_value(feasible, &x_new_lpvalue);
   }
@@ -1166,6 +2130,156 @@ void na_plugin_decide(plugin_t* plugin, variable_t x, trail_token_t* decide_toke
     // Decide the to_decide_value
     const mcsat_value_t* to_decide_value_ptr = using_cached ? x_cached_value : &to_decide_value;
     decide_token->add(decide_token, x, to_decide_value_ptr);
+
+    /* If this variable has an associated sin term, compute approximation
+     * for the decided value and set it as a hint for the sin-variable. */
+    term_t sin_term = na_plugin_var_has_sin_term(na, x);
+    if (sin_term != NULL_TERM) {
+      if (ctx_trace_enabled(na->ctx, "na::decide")) {
+       ctx_trace_printf(na->ctx, "variable has associated sin term\n");
+      }
+
+      variable_t sin_var = variable_db_get_variable_if_exists(na->ctx->var_db, sin_term);
+      assert(sin_var != variable_null);
+
+      //ctx_trace_printf(na->ctx, "sin_var != variable_null\n");
+      mcsat_value_t approx = compute_sin_approximation(to_decide_value_ptr, 53); // TODO_NTA how to manage precision here?
+
+
+      // get pi variable
+      term_t pi_term = nta_info_get_pi(na->nta_info);
+      variable_t pi_var = variable_db_get_variable(na->ctx->var_db, pi_term);
+      assert(pi_var != variable_null);
+      /* hint the next decision to choose pi_var */
+      na->ctx->hint_next_decision(na->ctx, pi_var);
+      // // hint pi to 355/113
+      // lp_rational_t pi_rational;
+      // lp_rational_construct_from_int(&pi_rational, 355, 113);
+      // lp_value_t pi_lp_value;
+      // lp_value_construct(&pi_lp_value, LP_VALUE_RATIONAL, &pi_rational);
+      // mcsat_value_t pi_value;
+      // mcsat_value_construct_lp_value(&pi_value, &pi_lp_value);
+      // na->ctx->hint_value(na->ctx, pi_var, &pi_value);
+      // mcsat_value_destruct(&pi_value);
+      // lp_value_destruct(&pi_lp_value);
+      // lp_rational_destruct(&pi_rational);
+
+      if (na->nta_info->use_period_for_sin) {
+        term_t period_term = na_plugin_var_has_period_term(na, x);
+        if (period_term != NULL_TERM) {
+          variable_t period_var = variable_db_get_variable_if_exists(na->ctx->var_db, period_term);
+          if (period_var != variable_null && !trail_has_value(na->ctx->trail, period_var)) {
+            na->ctx->hint_next_decision(na->ctx, period_var);
+            if (ctx_trace_enabled(na->ctx, "na::decide")) {
+              ctx_trace_printf(na->ctx, "hint next decision for period variable ");
+              variable_db_print_variable(na->ctx->var_db, period_var, ctx_trace_out(na->ctx));
+              ctx_trace_printf(na->ctx, "[%d]\n", period_var);
+            }
+          }
+        }
+      }
+
+      
+
+
+      /* hint the next decision to choose sin_var if not already in trail */
+      if (!trail_has_value(na->ctx->trail, sin_var)) {
+        na->ctx->hint_next_decision(na->ctx, sin_var);
+        /* hint the sin-variable with the approximation (trail will copy it) */
+        na->ctx->hint_value(na->ctx, sin_var, &approx);
+        /* approx contains a rational that will be copied into the trail cache */
+      }
+
+      if (ctx_trace_enabled(na->ctx, "na::decide")) {
+        ctx_trace_printf(na->ctx, "hint value for sin variable ");
+        variable_db_print_variable(na->ctx->var_db, sin_var, ctx_trace_out(na->ctx));
+        ctx_trace_printf(na->ctx, "[%d]: ", sin_var);
+        mcsat_value_print(&approx, ctx_trace_out(na->ctx));
+        ctx_trace_printf(na->ctx, "\n");
+      }
+      
+      //else{
+      //  ctx_trace_printf(na->ctx, "sin_var == variable_null\n");
+      //}
+    }
+
+
+    /* If this variable is a sin term, hint period for next decision (it will trigger decision on original variable) */
+    term_t inverse_term = na_plugin_var_has_inverse_sin_term(na, x);
+    if (inverse_term != NULL_TERM) {
+      if (ctx_trace_enabled(na->ctx, "na::decide")) {
+       ctx_trace_printf(na->ctx, "variable is sin term\n");
+      }
+      variable_t inverse_var = variable_db_get_variable_if_exists(na->ctx->var_db, inverse_term);
+      //assert(inverse_var != variable_null);
+
+      // get pi variable
+      term_t pi_term = nta_info_get_pi(na->nta_info);
+      variable_t pi_var = variable_db_get_variable_if_exists(na->ctx->var_db, pi_term);
+      //assert(pi_var != variable_null);
+
+      // if pi not in the trail, hint pi for next decision, and try not to decide now (unless must is true)
+      if (pi_var != variable_null && !trail_has_value(na->ctx->trail, pi_var)) {
+        if (ctx_trace_enabled(na->ctx, "na::decide")) {
+          ctx_trace_printf(na->ctx, "hint next decision for pi variable ");
+          variable_db_print_variable(na->ctx->var_db, pi_var, ctx_trace_out(na->ctx));
+          ctx_trace_printf(na->ctx, "[%d]\n", pi_var);
+        }
+        /* hint the next decision to choose pi_var */
+        na->ctx->hint_next_decision(na->ctx, pi_var);
+        // if(!must){
+        //   return;
+        // }
+      }
+
+      if (inverse_var != variable_null && na->nta_info->use_period_for_sin) {
+        term_t period_term = na_plugin_var_has_period_term(na, inverse_var);
+        if (period_term != NULL_TERM) {
+          variable_t period_var = variable_db_get_variable_if_exists(na->ctx->var_db, period_term);
+
+          // if period_var not in the trail, hint period_var for next decision, and try not to decide now (unless must is true)
+          if (period_var != variable_null && !trail_has_value(na->ctx->trail, period_var)) {
+            if (ctx_trace_enabled(na->ctx, "na::decide")) {
+              ctx_trace_printf(na->ctx, "hint next decision for period variable ");
+              variable_db_print_variable(na->ctx->var_db, period_var, ctx_trace_out(na->ctx));
+              ctx_trace_printf(na->ctx, "[%d]\n", period_var);
+            }
+            na->ctx->hint_next_decision(na->ctx, period_var);
+            // if(!must){
+            //   return;
+            // }
+          }
+        }
+      }
+
+
+      // if inverse_var not in the trail hint inverse_var for next decision
+      if (inverse_var != variable_null && !trail_has_value(na->ctx->trail, inverse_var)) {
+        if (ctx_trace_enabled(na->ctx, "na::decide")) {
+          ctx_trace_printf(na->ctx, "hint next decision for inverse variable ");
+          variable_db_print_variable(na->ctx->var_db, inverse_var, ctx_trace_out(na->ctx));
+          ctx_trace_printf(na->ctx, "[%d]\n", inverse_var);
+        }   
+          na->ctx->hint_next_decision(na->ctx, inverse_var);
+      }
+
+    
+
+      // // hint pi to 355/113
+      // lp_rational_t pi_rational;
+      // lp_rational_construct_from_int(&pi_rational, 355, 113);
+      // lp_value_t pi_lp_value;
+      // lp_value_construct(&pi_lp_value, LP_VALUE_RATIONAL, &pi_rational);
+      // mcsat_value_t pi_value;
+      // mcsat_value_construct_lp_value(&pi_value, &pi_lp_value);
+      // na->ctx->hint_value(na->ctx, pi_var, &pi_value);
+      // mcsat_value_destruct(&pi_value);
+      // lp_value_destruct(&pi_lp_value);
+      // lp_rational_destruct(&pi_rational);
+
+    }
+    
+
 
     // Remember that we've decided this guy
     na->last_decided_and_unprocessed = x;
@@ -1304,12 +2418,31 @@ void na_plugin_get_real_conflict(na_plugin_t* na, const int_mset_t* pos, const i
     ctx_trace_term(na->ctx, variable_db_get_term(na->ctx->var_db, x));
   }
 
+
+
   // The assertions on x that are in conflict (as constraint variables)
   ivector_t core, lemma_reasons;
   init_ivector(&core, 0);
   init_ivector(&lemma_reasons, 0);
   feasible_set_db_get_conflict_reasons(na->feasible_set_db, x, NULL, &core, &lemma_reasons);
 
+  // Add NTA refinement lemmas to the conflict
+  if (na->conflict_refinement_lemmas.size > 0) {
+    if (ctx_trace_enabled(na->ctx, "na::conflict")) {
+      ctx_trace_printf(na->ctx, "na_plugin_get_conflict(): adding refinement lemmas:\n");
+      for (i = 0; i < na->conflict_refinement_lemmas.size; ++ i) {
+        ctx_trace_printf(na->ctx, "[%zu]: ", i);
+        ctx_trace_term(na->ctx, na->conflict_refinement_lemmas.data[i]);
+      }
+    }
+    for (i = 0; i < na->conflict_refinement_lemmas.size; ++ i) {
+      term_t lemma_term = na->conflict_refinement_lemmas.data[i];
+      variable_t lemma_var = variable_db_get_variable(na->ctx->var_db, lemma_term);
+      // Treat refinement lemmas like any other constraint reason for projection
+      ivector_push(&core, lemma_var);
+    }
+  }
+  
   if (ctx_trace_enabled(na->ctx, "na::conflict")) {
     ctx_trace_printf(na->ctx, "na_plugin_get_conflict(): core:\n");
     for (i = 0; i < core.size; ++ i) {
@@ -1714,6 +2847,22 @@ void na_plugin_get_conflict(plugin_t* plugin, ivector_t* conflict) {
     na_plugin_get_assumption_conflict(na, na->conflict_variable_assumption, conflict);
   }
 
+  // for (uint32_t i = 0; i < conflict->size; ++i) {
+  //   term_t literal = conflict->data[i];
+  //   bool literal_value = false;
+  //   if (na_plugin_literal_value_in_trail(na, literal, &literal_value)) {
+  //     if (!literal_value) {
+  //       conflict->data[i] = opposite_term(literal);
+  //     }
+  //     continue;
+  //   }
+
+  //   term_t opposite = opposite_term(literal);
+  //   if (na_plugin_literal_value_in_trail(na, opposite, &literal_value) && literal_value) {
+  //     conflict->data[i] = opposite;
+  //   }
+  // }
+
   int_mset_destruct(&pos);
   int_mset_destruct(&neg);
 
@@ -1842,6 +2991,7 @@ void na_plugin_pop(plugin_t* plugin) {
   na->conflict_variable_int = variable_null;
   na->conflict_variable_assumption = variable_null;
   lp_value_assign_raw(&na->conflict_variable_value, LP_VALUE_NONE, 0);
+  ivector_reset(&na->conflict_refinement_lemmas);
 
   // We undid last decision, so we're back to normal
   na->last_decided_and_unprocessed = variable_null;
@@ -2099,7 +3249,7 @@ void na_plugin_learn(plugin_t* plugin, trail_token_t* prop) {
     }
 
     if (ctx_trace_enabled(na->ctx, "mcsat::na::learn")) {
-      ctx_trace_printf(na->ctx, "na_plugin_learn(): ");
+      ctx_trace_printf(na->ctx, "\nna_plugin_learn(): ");
       ctx_trace_term(na->ctx, variable_db_get_term(na->ctx->var_db, constraint_var));
     }
 
@@ -2198,4 +3348,11 @@ plugin_t* na_plugin_allocator(void) {
   plugin->plugin_interface.set_exception_handler = na_plugin_set_exception_handler;
 
   return (plugin_t*) plugin;
+}
+
+void na_plugin_set_nta_info(plugin_t* plugin, nta_info_t* nta_info) {
+  na_plugin_t* na = (na_plugin_t*) plugin;
+  if (na != NULL) {
+    na->nta_info = nta_info;
+  }
 }

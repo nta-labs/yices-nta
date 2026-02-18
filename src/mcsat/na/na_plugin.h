@@ -20,8 +20,12 @@
 #define NA_PLUGIN_H_
 
 #include "mcsat/plugin.h"
+#include "mcsat/nta_info.h"
 
 /** Allocate a new na plugin and setup the plugin-interface method */
 plugin_t* na_plugin_allocator(void);
+
+/** Set the nta_info pointer in the NA plugin */
+void na_plugin_set_nta_info(plugin_t* plugin, nta_info_t* nta_info);
 
 #endif /* NA_PLUGIN_H_ */

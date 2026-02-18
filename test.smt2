@@ -1,0 +1,12 @@
+(set-logic QF_NRA)
+(declare-fun x () Real)
+(declare-fun sin (Real) Real)
+(assert (< x 0.5))
+(assert (> x 0.3))
+;(assert (> (sin x) x))
+(assert (< (sin x) x))
+;(assert (= 1 (* (sin x) (sin x))))
+(check-sat)
+(get-model)
+;(get-value (x (sin x)))
+

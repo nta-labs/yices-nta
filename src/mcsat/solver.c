@@ -47,8 +47,10 @@
 #include "mcsat/bv/bv_plugin.h"
 #include "mcsat/ff/ff_plugin.h"
 #include "mcsat/na/na_plugin.h"
+#include "mcsat/na/nta_functions.h"
 
 #include "mcsat/preprocessor.h"
+#include "mcsat/nta_info.h"
 
 #include "mcsat/utils/statistics.h"
 
@@ -115,6 +117,9 @@ typedef struct {
   /** The solver */
   mcsat_solver_t* solver;
 } mcsat_evaluator_t;
+
+
+
 
 struct mcsat_solver_s {
 
@@ -312,6 +317,9 @@ struct mcsat_solver_s {
   uint32_t na_plugin_id;
   uint32_t bv_plugin_id;
   uint32_t ff_plugin_id;
+
+  /** Information on abstracted NTA terms */
+  nta_info_t nta_info;
 };
 
 static
@@ -835,6 +843,8 @@ void mcsat_add_plugins(mcsat_solver_t* mcsat) {
   mcsat->uf_plugin_id = mcsat_add_plugin(mcsat, uf_plugin_allocator, "uf_plugin");
   mcsat->ite_plugin_id = mcsat_add_plugin(mcsat, ite_plugin_allocator, "ite_plugin");
   mcsat->na_plugin_id = mcsat_add_plugin(mcsat, na_plugin_allocator, "na_plugin");
+  /* Set the nta_info pointer on the plugin */
+  na_plugin_set_nta_info(mcsat->plugins[mcsat->na_plugin_id].plugin, &mcsat->nta_info);
   mcsat->bv_plugin_id = mcsat_add_plugin(mcsat, bv_plugin_allocator, "bv_plugin");
   mcsat->ff_plugin_id = mcsat_add_plugin(mcsat, ff_plugin_allocator, "ff_plugin");
 }
@@ -909,8 +919,19 @@ void mcsat_construct(mcsat_solver_t* mcsat, const context_t* ctx) {
   // Construct the evaluator
   mcsat_evaluator_construct(&mcsat->evaluator, mcsat);
 
+
   // Construct the preprocessor
   preprocessor_construct(&mcsat->preprocessor, mcsat->terms, mcsat->exception, &mcsat->ctx->mcsat_options);
+  
+  // Init nta_info and set it in the preprocessor
+  nta_info_init(&mcsat->nta_info);
+  mcsat->trail->nta_info = &mcsat->nta_info;
+  mcsat->nta_info.use_period_for_sin = !mcsat->ctx->mcsat_options.no_sin_period;
+  if (mcsat->ctx->mcsat_options.nta_delta_set) {
+    mcsat->nta_info.delta_mode = true;
+    mcsat->nta_info.delta = mcsat->ctx->mcsat_options.nta_delta;
+  }
+  preprocessor_set_nta_info(&mcsat->preprocessor, &mcsat->nta_info);
 
   // The variable queue
   init_ivector(&mcsat->top_decision_vars, 0);
@@ -995,6 +1016,20 @@ mcsat_solver_t* mcsat_new(const context_t* ctx) {
 
 smt_status_t mcsat_status(const mcsat_solver_t* mcsat) {
   return mcsat->status;
+}
+
+bool mcsat_delta_used_in_trail(const mcsat_solver_t* mcsat) {
+  if (mcsat == NULL || mcsat->trail == NULL) {
+    return false;
+  }
+  return delta_used_in_trail(mcsat->trail);
+}
+
+int32_t mcsat_get_nta_delta(const mcsat_solver_t* mcsat) {
+  if (mcsat == NULL) {
+    return 0;
+  }
+  return mcsat->nta_info.delta;
 }
 
 static
@@ -1419,6 +1454,11 @@ void mcsat_gc(mcsat_solver_t* mcsat, bool mark_and_gc_internal) {
 static
 void mcsat_backtrack_to(mcsat_solver_t* mcsat, uint32_t level, bool update_cache) {
   assert((int32_t) level >= mcsat->assumptions_decided_level);
+  // print beginning of mcsat_backtrack_to
+  if (trace_enabled(mcsat->ctx->trace, "mcsat::incremental")) {
+    mcsat_trace_printf(mcsat->ctx->trace, "mcsat_backtrack_to(%u)\n", level);
+    trail_print(mcsat->trail, trace_out(mcsat->ctx->trace));
+  }
   while (mcsat->trail->decision_level > level) {
 
     if (trace_enabled(mcsat->ctx->trace, "mcsat::incremental")) {
@@ -1790,6 +1830,8 @@ void mcsat_add_lemma(mcsat_solver_t* mcsat, ivector_t* lemma, term_t decision_bo
       if (level > top_level) {
         top_level = level;
       }
+      // print top level
+      //mcsat_trace_printf(mcsat->ctx->trace, "top level: %u\n", top_level);
     } else {
       ivector_push(&unassigned, lemma->data[i]);
     }
@@ -2168,9 +2210,15 @@ void mcsat_analyze_conflicts(mcsat_solver_t* mcsat, uint32_t* restart_resource) 
 
   // Construct the conflict
   conflict_construct(&conflict, &reason, true, (mcsat_evaluator_interface_t*) &mcsat->evaluator, mcsat->var_db, mcsat->trail, &mcsat->tm, mcsat->ctx->trace);
+  // NTA: do not enable this trace, the abstracted formula in NRA can be satisfiable, but the original NTA formula is not
   if (trace_enabled(trace, "mcsat::conflict::check")) {
     // Don't check bool conflicts: they are implied by the formula (clauses)
     if (plugin_i != mcsat->bool_plugin_id) {
+      if (trace_enabled(trace, "na::nta")) {
+        mcsat_trace_printf(trace, "conflict before check:\n");
+        conflict_print(&conflict, trace->file);
+        mcsat_trace_printf(trace, "end conflict before check\n");
+      }
       conflict_check(&conflict);
     }
   }
@@ -2183,12 +2231,20 @@ void mcsat_analyze_conflicts(mcsat_solver_t* mcsat, uint32_t* restart_resource) 
 
   // Get the level of the conflict and backtrack to it
   conflict_level = conflict_get_level(&conflict);
+  if (trace_enabled(trace, "na::nta")){
+    mcsat_trace_printf(trace, "conflict level: %u\n", conflict_level);
+  }
   // Backtrack max(base, assumptions, conflict)
   backtrack_level = mcsat_compute_backtrack_level(mcsat, conflict_level);
   mcsat_backtrack_to(mcsat, backtrack_level, false);
+  //print backtrack level
+  if (trace_enabled(trace, "na::nta")){
+    mcsat_trace_printf(trace, "backtrack level: %u\n", backtrack_level);
+  }
 
   // Analyze while at least one variable at conflict level
   while (true) {
+    //mcsat_trace_printf(trace, "\nSTARTING WHILE (analyze conflict)\n");
 
     if (mcsat_conflict_with_assumptions(mcsat, conflict_level)) {
       // Resolved below assumptions, we're done
@@ -2201,6 +2257,10 @@ void mcsat_analyze_conflicts(mcsat_solver_t* mcsat, uint32_t* restart_resource) 
     }
 
     if (conflict_get_top_level_vars_count(&conflict) == 1) {
+      // print some info about UIP
+      if(trace_enabled(trace, "mcsat::conflict")) {
+        mcsat_trace_printf(trace, "conflict_get_top_level_vars_count(&conflict) == 1\n");
+      }
       // UIP-like situation, we can quit as long as we make progress, as in
       // the following cases:
       //
@@ -2562,6 +2622,39 @@ bool mcsat_decide(mcsat_solver_t* mcsat) {
       }
     }
 
+    // If enabled, decide Boolean variables before theory variables.
+    // This is implemented as a best-effort scan of the variable queue:
+    // we temporarily remove non-Boolean unassigned variables until we
+    // find an unassigned Boolean variable, then reinsert the others.
+    double* seed1 = &mcsat->heuristic_params.random_decision_seed;
+    if (var == variable_null && (drand(seed1) <= mcsat->ctx->mcsat_options.bool_freq)) {
+      ivector_t deferred;
+      init_ivector(&deferred, 0);
+
+      while (!var_queue_is_empty(&mcsat->var_queue) && var == variable_null) {
+        variable_t candidate = var_queue_pop(&mcsat->var_queue);
+
+        // Drop assigned candidates (they'll be re-added on backtrack when unassigned).
+        if (trail_has_value(mcsat->trail, candidate)) {
+          continue;
+        }
+
+        if (variable_db_get_type_kind(mcsat->var_db, candidate) == BOOL_TYPE) {
+          var = candidate;
+          force_decision = true;
+          break;
+        }
+
+        ivector_push(&deferred, candidate);
+      }
+
+      // Put all deferred variables back into the queue.
+      for (uint32_t i = 0; i < deferred.size; ++i) {
+        var_queue_insert(&mcsat->var_queue, deferred.data[i]);
+      }
+      delete_ivector(&deferred);
+    }
+
     // then try the variables a plugin requested
     if (var == variable_null) {
       while (!int_queue_is_empty(&mcsat->hinted_decision_vars)) {
@@ -2801,6 +2894,14 @@ void mcsat_solve(mcsat_solver_t* mcsat, const param_t *params, model_t* mdl, uin
     assert(int_queue_is_empty(&mcsat->registration_queue));
     goto solve_done;
   }
+
+  if (mcsat->ctx->mcsat_options.nta_delta_set) {
+    mcsat->nta_info.delta_mode = true;
+    mcsat->nta_info.delta = mcsat->ctx->mcsat_options.nta_delta;
+  } else {
+    mcsat->nta_info.delta_mode = false;
+  }
+  mcsat->nta_info.use_period_for_sin = !mcsat->ctx->mcsat_options.no_sin_period;
 
   if (trace_enabled(mcsat->ctx->trace, "mcsat::solve")) {
     static int count = 0;
@@ -3090,6 +3191,13 @@ void mcsat_set_exception_handler(mcsat_solver_t* mcsat, jmp_buf* handler) {
     plugin_t* plugin = mcsat->plugins[i].plugin;
     plugin->set_exception_handler(plugin, handler);
   }
+}
+
+void mcsat_set_use_period_for_sin(mcsat_solver_t* mcsat, bool use_period_for_sin) {
+  if (mcsat == NULL) {
+    return;
+  }
+  mcsat->nta_info.use_period_for_sin = use_period_for_sin;
 }
 
 void mcsat_gc_mark(mcsat_solver_t* mcsat) {

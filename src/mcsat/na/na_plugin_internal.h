@@ -30,6 +30,7 @@
 #include "mcsat/na/feasible_set_db.h"
 
 #include "terms/term_manager.h"
+#include "mcsat/nta_info.h"
 
 struct na_plugin_s {
 
@@ -38,6 +39,9 @@ struct na_plugin_s {
 
   /** The plugin context */
   plugin_context_t* ctx;
+
+  /** Pointer to the global nta_info (from solver) */
+  nta_info_t* nta_info;
 
   /** The watch list manager */
   watch_list_manager_t wlm;
@@ -62,6 +66,9 @@ struct na_plugin_s {
 
   /** The value that got the assumptions variable in trouble */
   lp_value_t conflict_variable_value;
+
+  /** Refinement lemmas added during NTA conflict (for conflict explanation) */
+  ivector_t conflict_refinement_lemmas;
 
   /** Bound variable term */
   term_t global_bound_term;

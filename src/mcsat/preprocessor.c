@@ -36,10 +36,13 @@
 #include "yices.h"
 #include "api/yices_api_lock_free.h"
 
+#include "mcsat/nta_info.h"
+
 void preprocessor_construct(preprocessor_t* pre, term_table_t* terms, jmp_buf* handler, const mcsat_options_t* options) {
   pre->terms = terms;
   init_term_manager(&pre->tm, terms);
   init_int_hmap(&pre->preprocess_map, 0);
+  init_int_hmap(&pre->preprocess_inverse_map, 0);
   init_ivector(&pre->preprocess_map_list, 0);
   init_int_hmap(&pre->purification_map, 0);
   init_ivector(&pre->purification_map_list, 0);
@@ -47,6 +50,7 @@ void preprocessor_construct(preprocessor_t* pre, term_table_t* terms, jmp_buf* h
   init_int_hmap(&pre->equalities, 0);
   init_ivector(&pre->equalities_list, 0);
   pre->tracer = NULL;
+  pre->nta_info = NULL;
   pre->exception = handler;
   pre->options = options;
   scope_holder_construct(&pre->scope);
@@ -56,10 +60,19 @@ void preprocessor_set_tracer(preprocessor_t* pre, tracer_t* tracer) {
   pre->tracer = tracer;
 }
 
+/** Set pointer to the global NTA info structure */
+void preprocessor_set_nta_info(preprocessor_t* pre, nta_info_t* nta_info) {
+  pre->nta_info = nta_info;
+  if (nta_info != NULL) {
+    nta_info->preprocessor = pre;
+  }
+}
+
 void preprocessor_destruct(preprocessor_t* pre) {
   delete_int_hmap(&pre->purification_map);
   delete_ivector(&pre->purification_map_list);
   delete_int_hmap(&pre->preprocess_map);
+  delete_int_hmap(&pre->preprocess_inverse_map);
   delete_ivector(&pre->preprocess_map_list);
   delete_ivector(&pre->preprocessing_stack);
   delete_int_hmap(&pre->equalities);
@@ -68,7 +81,6 @@ void preprocessor_destruct(preprocessor_t* pre) {
   scope_holder_destruct(&pre->scope);
 }
 
-static
 term_t preprocessor_get(preprocessor_t* pre, term_t t) {
   int_hmap_pair_t* find = int_hmap_find(&pre->preprocess_map, t);
   if (find == NULL) {
@@ -78,10 +90,26 @@ term_t preprocessor_get(preprocessor_t* pre, term_t t) {
   }
 }
 
+term_t preprocessor_get_inverse(preprocessor_t* pre, term_t t_pre) {
+  if (t_pre == NULL_TERM) {
+    return NULL_TERM;
+  }
+  int_hmap_pair_t* find = int_hmap_find(&pre->preprocess_inverse_map, t_pre);
+  return find == NULL ? NULL_TERM : find->val;
+}
+
 static
 void preprocessor_set(preprocessor_t* pre, term_t t, term_t t_pre) {
   assert(preprocessor_get(pre, t) == NULL_TERM);
   int_hmap_add(&pre->preprocess_map, t, t_pre);
+  int_hmap_pair_t* inv = int_hmap_find(&pre->preprocess_inverse_map, t_pre);
+  if (inv == NULL) {
+    int_hmap_add(&pre->preprocess_inverse_map, t_pre, t);
+  } else {
+    if (inv->val != t) {
+      // keep the first inverse mapping to avoid conflicts
+    }
+  }
   ivector_push(&pre->preprocess_map_list, t);
 }
 
@@ -92,6 +120,27 @@ typedef struct composite_term1_s {
 
 static
 composite_term1_t composite_for_noncomposite;
+
+// Counter for generated sin/temporary variable names
+static uint32_t sin_name_counter = 0;
+
+static
+char* alloc_div_label(term_table_t* terms, term_t t) {
+  const char* name = term_name(terms, t);
+  if (name != NULL) {
+    size_t len = strlen(name);
+    char* out = (char*) malloc(len + 1);
+    strcpy(out, name);
+    return out;
+  } else {
+    char buf[32];
+    snprintf(buf, sizeof(buf), "t%u", (uint32_t) index_of(t));
+    size_t len = strlen(buf);
+    char* out = (char*) malloc(len + 1);
+    strcpy(out, buf);
+    return out;
+  }
+}
 
 static
 composite_term_t* get_composite(term_table_t* terms, term_kind_t kind, term_t t) {
@@ -320,6 +369,33 @@ term_t preprocessor_purify(preprocessor_t* pre, term_t t, ivector_t* out) {
 }
 
 static inline
+void preprocessor_record_original_atom(preprocessor_t* pre, term_t t) {
+  if (pre->nta_info == NULL) {
+    return;
+  }
+  term_t atom = unsigned_term(t);
+  term_kind_t kind = term_kind(pre->terms, atom);
+  switch (kind) {
+  case ARITH_EQ_ATOM:
+  case ARITH_GE_ATOM:
+  case ARITH_IS_INT_ATOM:
+  case ARITH_ROOT_ATOM:
+  case ITE_TERM:
+  case ITE_SPECIAL:
+  case APP_TERM:
+  case EQ_TERM:
+  case OR_TERM:
+  case XOR_TERM:
+  case ARITH_BINEQ_ATOM:
+  case ARITH_DIVIDES_ATOM:
+    int_hset_add(&pre->nta_info->original_atoms, atom);
+    break;
+  default:
+    break;
+  }
+}
+
+static inline
 term_t mk_bvneg(term_manager_t* tm, term_t t) {
   term_table_t* terms = tm->terms;
   if (term_bitsize(terms,t) <= 64) {
@@ -366,6 +442,10 @@ term_t preprocessor_apply(preprocessor_t* pre, term_t t, ivector_t* out, bool is
   term_manager_t* tm = &pre->tm;
 
   uint32_t i, j, n;
+  uint32_t out_start = 0;
+  if (out != NULL) {
+    out_start = out->size;
+  }
 
   // Check if already preprocessed;
   term_t t_pre = preprocessor_get(pre, t);
@@ -399,6 +479,7 @@ term_t preprocessor_apply(preprocessor_t* pre, term_t t, ivector_t* out, bool is
     if (trace_enabled(pre->tracer, "mcsat::preprocess")) {
       mcsat_trace_printf(pre->tracer, "current = ");
       trace_term_ln(pre->tracer, terms, current);
+      mcsat_trace_printf(pre->tracer, "\tid = %d\n", current);    
     }
 
     // If preprocessed already, done
@@ -453,7 +534,25 @@ term_t preprocessor_apply(preprocessor_t* pre, term_t t, ivector_t* out, bool is
 
     case UNINTERPRETED_TERM:  // (i.e., global variables, can't be bound).
       current_pre = current;
-      // Unless we want special slicing
+      if (trace_enabled(pre->tracer, "mcsat::preprocess")) {
+        mcsat_trace_printf(pre->tracer, "UNINTERPRETED_TERM = ");
+        trace_term_ln(pre->tracer, terms, current);
+      }
+      /* Special handling for pi symbol: if this variable is named "pi",
+         ensure nta_info->pi is set, or replace with the stored pi symbol. */
+      if (type == REAL_TYPE) {
+        const char *tname = term_name(terms, current);
+        if (tname != NULL && strcmp(tname, "pi") == 0 && pre->nta_info != NULL) {
+          nta_info_set_is_nta(pre->nta_info);
+          term_t stored_pi = nta_info_get_pi(pre->nta_info);
+          if (stored_pi == NULL_TERM) {
+            nta_info_set_pi(pre->nta_info, current);
+            current_pre = current;
+          } else {
+            current_pre = stored_pi;
+          }
+        }
+      }
       if (type == BITVECTOR_TYPE) {
         if (pre->options->bv_var_size > 0) {
           uint32_t size = term_bitsize(terms, current);
@@ -991,7 +1090,328 @@ term_t preprocessor_apply(preprocessor_t* pre, term_t t, ivector_t* out, bool is
     // FOLLOWING ARE UNINTEPRETED, SO WE PURIFY THE ARGUMENTS
 
     case APP_TERM:           // application of an uninterpreted function
+    {
+      composite_term_t* desc = get_composite(terms, current_kind, current);
+
+
+      if (trace_enabled(pre->tracer, "mcsat::preprocess")) {
+        mcsat_trace_printf(pre->tracer, "APP_TERM = ");
+        //mcsat_trace_printf(pre->tracer, (char)  type);
+        // print current          
+        trace_term_ln(pre->tracer, terms, current);
+        mcsat_trace_printf(pre->tracer, "\tcurrent type: \t %d\n",type);
+        /*
+        // print type of current
+        type_t current_type = term_type(terms, current);
+        mcsat_trace_printf(pre->tracer, "type of current = ");
+        trace_type_ln(pre->tracer, terms->types, current_type);*/
+      }
+
+      bool is_sin = false;
+      bool is_exp = false;
+      const char* name_arg1 = NULL;
+      // Abstract sin term
+      if (desc->arity == 2) {
+        term_t arg0 = desc->arg[0];
+        const char* name_arg0 = term_name(terms, arg0);
+        //type_t arg_type0 = term_type(terms, arg0);
+        //printf("\t\tname0:%s", name_arg0);
+        term_t arg1 = desc->arg[1];
+        //assert(term_type(terms, arg1) == REAL_TYPE || term_type(terms, arg1) == INT_TYPE);
+        //type_t arg_type1 = term_type(terms, arg1);
+        //printf("\t\tname1:%s", name_arg1);
+        type_kind_t arg1_type_kind = term_type_kind(terms, arg1);
+        bool arg_is_numeric = (arg1_type_kind == REAL_TYPE || arg1_type_kind == INT_TYPE);
+        term_t sin_sym = get_term_by_name(terms, "sin");
+        term_t exp_sym = get_term_by_name(terms, "exp");
+        if (arg_is_numeric && ((name_arg0 != NULL && strcmp(name_arg0, "sin") == 0) || (sin_sym != NULL_TERM && sin_sym == arg0))) {
+          is_sin = true;
+          if (trace_enabled(pre->tracer, "mcsat::preprocess")) {
+            mcsat_trace_printf(pre->tracer, "\nis sin\n ");
+          }
+        } else if (arg_is_numeric && ((name_arg0 != NULL && strcmp(name_arg0, "exp") == 0) || (exp_sym != NULL_TERM && exp_sym == arg0))) {
+          is_exp = true;
+          if (trace_enabled(pre->tracer, "mcsat::preprocess")) {
+            mcsat_trace_printf(pre->tracer, "\nis exp\n ");
+          }
+        }
+        if (is_sin || is_exp) {
+          name_arg1 = term_name(terms, arg1);
+        }
+      }
+      if (is_sin || is_exp) {
+        // trace print we are in sin or exp abstraction
+        if (trace_enabled(pre->tracer, "na::nta")) {
+          if (is_sin) {
+            mcsat_trace_printf(pre->tracer, "abstracting sin term: ");
+          } else {
+            mcsat_trace_printf(pre->tracer, "abstracting exp term: ");
+          }
+          trace_term_ln(pre->tracer, terms, current);
+        }
+        term_t arg1 = desc->arg[1];
+        term_t arg1_pre = preprocessor_get(pre, arg1);
+        if (arg1_pre == NULL_TERM) {
+          ivector_push(pre_stack, arg1);
+          break;
+        }
+        // arg1 may be a complex term (e.g. x+1)
+        // currently, the abstraction can only work with variables as arguments.
+        // hence, for complex term, let's introduce or reuse a fresh variable
+        term_t arg1_canon = arg1_pre;
+        term_t arg_var = arg1_canon;
+        if (!(term_kind(terms, arg1_canon) == UNINTERPRETED_TERM &&
+          (term_type_kind(terms, arg1_canon) == REAL_TYPE || term_type_kind(terms, arg1_canon) == INT_TYPE))) {
+          term_t mapped = NULL_TERM;
+          if (pre->nta_info != NULL) {
+            int_hmap_pair_t* find_arg = int_hmap_find(&pre->nta_info->arg_map, arg1_canon);
+            if (find_arg != NULL) {
+              mapped = find_arg->val;
+            }
+          }
+          if (mapped != NULL_TERM) {
+            arg_var = mapped;
+          } else {
+            // create a fresh variable to stand for arg1, add equality lemma arg_var = arg1
+            term_t fresh = new_uninterpreted_term(terms, yices_real_type());
+            const char* arg_name = NULL;
+            if (name_arg1 != NULL) {
+              arg_name = (char*) malloc(strlen("arg_") + strlen(name_arg1) + 1);
+              strcpy((char*) arg_name, "arg_");
+              strcat((char*) arg_name, name_arg1);
+            } else {
+              char* buf = (char*) malloc(32);
+              snprintf(buf, 32, "arg_%u", sin_name_counter);
+              arg_name = buf;
+            }
+            yices_set_term_name(fresh, arg_name);
+            // register in preprocessor maps
+            preprocessor_set(pre, fresh, fresh);
+            term_t eq_orig = mk_eq(&pre->tm, fresh, arg1_canon);
+            ivector_push(out, eq_orig);
+            if (pre->nta_info != NULL) {
+              int_hset_add(&pre->nta_info->nta_arg_equations, unsigned_term(eq_orig));
+              int_hmap_pair_t* find_arg = int_hmap_find(&pre->nta_info->arg_map, arg1_canon);
+              int_hmap_pair_t* find_inv = int_hmap_find(&pre->nta_info->inverse_arg_map, fresh);
+              if (find_arg == NULL && find_inv == NULL) {
+                int_hmap_add(&pre->nta_info->arg_map, arg1_canon, fresh);
+                int_hmap_add(&pre->nta_info->inverse_arg_map, fresh, arg1_canon);
+              } else {
+                if ((find_arg != NULL && find_arg->val != fresh) ||
+                    (find_inv != NULL && find_inv->val != arg1_canon)) {
+                  fprintf(stderr, "Error: trying to set different arg abstraction for the same term.\n");
+                  yices_print_error(stderr);
+                }
+              }
+              // print trace for the new equation
+              if (trace_enabled(pre->tracer, "mcsat::preprocess")) {
+                if (is_sin) {
+                  mcsat_trace_printf(pre->tracer, "added equation for nta sin abstraction: ");
+                } else {
+                  mcsat_trace_printf(pre->tracer, "added equation for nta exp abstraction: ");
+                }
+                trace_term_ln(pre->tracer, terms, eq_orig);
+              }
+            }
+            arg_var = fresh;
+          }
+        }
+
+        bool use_period = (is_sin && pre->nta_info != NULL && pre->nta_info->use_period_for_sin);
+        const char* abs_name;
+        const char* period_name = NULL;
+        if (name_arg1 != NULL) {
+          const char* prefix = is_sin ? "sin_" : "exp_";
+          abs_name = (char*) malloc(strlen(prefix) + strlen(name_arg1) + 1);
+          strcpy((char*) abs_name, prefix);
+          strcat((char*) abs_name, name_arg1);
+          if (use_period) {
+            period_name = (char*) malloc(strlen("i_") + strlen(name_arg1) + 1);
+            strcpy((char*) period_name, "i_");
+            strcat((char*) period_name, name_arg1);
+          }
+        } else {
+          char *buf = (char*) malloc(32);
+          if (is_sin) {
+            sprintf(buf, "sin_%u", sin_name_counter);
+          } else {
+            sprintf(buf, "exp_%u", sin_name_counter);
+          }
+          abs_name = buf;
+          if (use_period) {
+            char *buf2 = (char*) malloc(32);
+            sprintf(buf2, "i_%u", sin_name_counter);
+            period_name = buf2;
+          }
+        }
+
+        // create new real variable for the abstraction
+        term_t new_abs_var = new_uninterpreted_term(terms, yices_real_type());
+        yices_set_term_name(new_abs_var, abs_name);
+
+        // create new integer variable used to encode sin periodicity
+        term_t period_var = NULL_TERM;
+        if (use_period) {
+          period_var = new_uninterpreted_term(terms, yices_int_type());
+          yices_set_term_name(period_var, period_name);
+        }
+
+        // Note: The variable will be registered automatically when it's encountered
+        // by the variable discovery mechanism during normal processing
+        current_pre = new_abs_var;
+
+        // ensure argument passed to nta_info is a variable
+        assert(term_kind(pre->terms, arg_var) == UNINTERPRETED_TERM && is_pos_term(arg_var));
+        if (is_sin) {
+          nta_info_set_sin_abstraction(pre->nta_info, arg_var, new_abs_var, period_var);
+        } else {
+          nta_info_set_exp_abstraction(pre->nta_info, arg_var, new_abs_var);
+        }
+        nta_info_set_is_nta(pre->nta_info);
+
+        if (is_sin) {
+          // check if pi is already present in nta_info
+          term_t pi = nta_info_get_pi(pre->nta_info);
+          if (pi == NULL_TERM) {
+            pi = new_uninterpreted_term(terms, yices_real_type());
+            yices_set_term_name(pi, "pi");
+            nta_info_set_pi(pre->nta_info, pi);
+            nta_info_set_is_nta(pre->nta_info);
+          }
+
+          if (trace_enabled(pre->tracer, "mcsat::preprocess")) {
+            mcsat_trace_printf(pre->tracer, "registered nta sin abstraction (argument, sin, period) = ");
+            trace_term_ln(pre->tracer, terms, arg_var);
+            trace_term_ln(pre->tracer, terms, new_abs_var);
+            if (use_period) {
+              trace_term_ln(pre->tracer, terms, period_var);
+            }
+          }
+        } else {
+          if (trace_enabled(pre->tracer, "mcsat::preprocess")) {
+            mcsat_trace_printf(pre->tracer, "registered nta exp abstraction (argument, exp) = ");
+            trace_term_ln(pre->tracer, terms, arg_var);
+            trace_term_ln(pre->tracer, terms, new_abs_var);
+          }
+        }
+      }
+      else{
+        
+        bool children_done = true;
+        bool children_same = true;
+
+        n = desc->arity;
+
+        ivector_t children;
+        init_ivector(&children, n);
+
+        for (i = 0; i < n; ++ i) {
+          term_t child = desc->arg[i];
+          term_t child_pre = preprocessor_get(pre, child);
+
+          if (child_pre == NULL_TERM) {
+            children_done = false;
+            ivector_push(pre_stack, child);
+          } else {
+            // Purify if needed
+            child_pre = preprocessor_purify(pre, child_pre, out);
+            // If interpreted terms, we need to purify non-variables
+            if (child_pre != child) { children_same = false; }
+          }
+
+          if (children_done) { ivector_push(&children, child_pre); }
+        }
+
+        if (children_done) {
+          if (children_same) {
+            current_pre = current;
+          } else {
+            current_pre = mk_composite(pre, current_kind, n, children.data);
+          }
+        }
+
+        delete_ivector(&children);
+      }
+
+      break;
+    }
+      // if (type == REAL_TYPE){
+      //   // get name of current
+      //   const char* name = term_name(terms, current);
+      //   // check if name is 'sin' and arity is 1
+      //   // print name
+      //   printf("\t\tname:%s", name);
+
+      //   //mcsat_trace_printf(pre->tracer, name);
+      //   if (name != NULL && strcmp(name, "sin") == 0) {
+      //         mcsat_trace_printf(pre->tracer, "\nis sin\n ");
+      //     composite_term_t* desc = get_composite(terms, APP_TERM, current);
+      //     if (desc->arity == 1) {
+      //       // create new real variable
+      //       if (trace_enabled(pre->tracer, "mcsat::preprocess")) {
+      //         mcsat_trace_printf(pre->tracer, "is sin\n ");
+      //       }
+            
+      //     }
+      //   }
+      // }
     case ARITH_RDIV:         // regular division (/ x y)
+    {
+      composite_term_t* desc = get_composite(terms, current_kind, current);
+      assert(desc->arity == 2);
+
+      term_t num = desc->arg[0];
+      term_t den = desc->arg[1];
+      term_t num_pre = preprocessor_get(pre, num);
+      term_t den_pre = preprocessor_get(pre, den);
+
+      if (num_pre == NULL_TERM) {
+        ivector_push(pre_stack, num);
+      }
+      if (den_pre == NULL_TERM) {
+        ivector_push(pre_stack, den);
+      }
+
+      if (num_pre != NULL_TERM && den_pre != NULL_TERM) {
+        num_pre = preprocessor_purify(pre, num_pre, out);
+        den_pre = preprocessor_purify(pre, den_pre, out);
+
+        char* num_label = alloc_div_label(terms, num_pre);
+        char* den_label = alloc_div_label(terms, den_pre);
+        size_t name_len = strlen("div_") + strlen(num_label) + strlen("_by_") + strlen(den_label) + 1;
+        char* div_name = (char*) malloc(name_len);
+        snprintf(div_name, name_len, "div_%s_by_%s", num_label, den_label);
+
+        term_t div_var = new_uninterpreted_term(terms, term_type(terms, current));
+        yices_set_term_name(div_var, div_name);
+
+        if (out != NULL) {
+          term_t guard = opposite_term(_o_yices_arith_eq0_atom(den_pre));
+          term_t mult = _o_yices_mul(den_pre, div_var);
+          term_t eq = _o_yices_eq(num_pre, mult);          
+          // and instead of implies 
+
+          term_t and_guard_eq[2] = { guard, eq };
+
+          term_t lemma_with_and = _o_yices_and(2, and_guard_eq);
+
+          term_t lemma = _o_yices_implies(guard, eq);
+          term_t lemma_to_push = pre->options->div_neq0 ? lemma_with_and : lemma;
+
+          ivector_push(out, lemma_to_push);
+
+          if (trace_enabled(pre->tracer, "mcsat::preprocess")) {
+            mcsat_trace_printf(pre->tracer, "adding rdiv lemma = ");
+            trace_term_ln(pre->tracer, terms, lemma_to_push);
+          }
+        }
+
+        current_pre = div_var;
+      }
+
+      break;
+    }
+
     case ARITH_IDIV:         // division: (div x y) as defined in SMT-LIB 2
     case ARITH_MOD:          // remainder: (mod x y) is y - x * (div x y)
     case UPDATE_TERM:        // update array
@@ -1147,11 +1567,13 @@ term_t preprocessor_apply(preprocessor_t* pre, term_t t, ivector_t* out, bool is
     }
 
     if (current_pre != NULL_TERM) {
+      preprocessor_record_original_atom(pre, current_pre);
       preprocessor_set(pre, current, current_pre);
       ivector_pop(pre_stack);
       if (trace_enabled(pre->tracer, "mcsat::preprocess")) {
         mcsat_trace_printf(pre->tracer, "current_pre = ");
         trace_term_ln(pre->tracer, terms, current_pre);
+        mcsat_trace_printf(pre->tracer, "\tid = %d\n", current_pre);    
       }
     }
 
@@ -1165,6 +1587,13 @@ term_t preprocessor_apply(preprocessor_t* pre, term_t t, ivector_t* out, bool is
   }
 
   ivector_reset(pre_stack);
+
+  preprocessor_record_original_atom(pre, t_pre);
+  if (out != NULL && out->size > out_start) {
+    for (i = out_start; i < out->size; ++i) {
+      preprocessor_record_original_atom(pre, out->data[i]);
+    }
+  }
 
   assert(t_pre != NULL_TERM);
   return t_pre;
@@ -1199,6 +1628,10 @@ void preprocessor_pop(preprocessor_t* pre) {
     ivector_pop(&pre->preprocess_map_list);
     int_hmap_pair_t* find = int_hmap_find(&pre->preprocess_map, t);
     assert(find != NULL);
+    int_hmap_pair_t* find_inv = int_hmap_find(&pre->preprocess_inverse_map, find->val);
+    if (find_inv != NULL && find_inv->val == t) {
+      int_hmap_erase(&pre->preprocess_inverse_map, find_inv);
+    }
     int_hmap_erase(&pre->preprocess_map, find);
   }
 

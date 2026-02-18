@@ -39,12 +39,15 @@
 #include "api/smt_logic_codes.h"
 #include "api/yices_globals.h"
 #include "context/context.h"
+#include "context/context_utils.h"
 #include "frontend/smt1/smt_lexer.h"
 #include "frontend/smt1/smt_parser.h"
 #include "frontend/smt1/smt_term_stack.h"
 
 #include "yices.h"
 #include "yices_exit_codes.h"
+
+#include "mcsat/solver.h"
 
 
 /*
@@ -755,7 +758,11 @@ static void print_results(void) {
 
   resu = context.core->status;
   if (resu == YICES_STATUS_SAT) {
-    printf("sat\n");
+    if (context_has_mcsat(&context) && mcsat_delta_used_in_trail(context.mcsat)) {
+      printf("sat (delta mode used with delta %"PRId32")\n", mcsat_get_nta_delta(context.mcsat));
+    } else {
+      printf("sat\n");
+    }
   } else if (resu == YICES_STATUS_UNSAT) {
     printf("unsat\n");
   } else {
@@ -777,7 +784,11 @@ static void print_results(void) {
   resu = context.core->status;
 
   if (resu == YICES_STATUS_SAT) {
-    printf("sat\n");
+    if (context_has_mcsat(&context) && mcsat_delta_used_in_trail(context.mcsat)) {
+      printf("sat (delta mode used with delta %"PRId32")\n", mcsat_get_nta_delta(context.mcsat));
+    } else {
+      printf("sat\n");
+    }
   } else if (resu == YICES_STATUS_UNSAT) {
     printf("unsat\n");
   } else {

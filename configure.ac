@@ -832,21 +832,34 @@ fi
 AC_CHECK_LIB(gmp, __gmpz_cmp, [],
     [AC_MSG_ERROR([*** GMP library not found. Try to set LDFLAGS ***])])
 
+#
+# NTA Dependencies
+#
+if test "$use_mcsat" = yes ; then
+    # Default Libpoly (required for MCSAT with both NRA and NTA)
+    AC_CHECK_LIB([poly],[lp_polynomial_new], [], [AC_MSG_ERROR([*** libpoly library not found. Try to set LDFLAGS ***])])
 
-#
-# Default libpoly
-#
-if test $use_mcsat = yes ; then
-   AC_CHECK_LIB([poly],[lp_polynomial_new], [], [AC_MSG_ERROR([*** libpoly library not found. Try to set LDFLAGS ***])])
+    # Check for FLINT/Arb headers
+    AC_CHECK_HEADERS([flint/fmpz.h flint/arb.h],
+        [],
+        [AC_MSG_ERROR([*** Required FLINT/Arb headers not found. Please set CPPFLAGS="-I/path/to/flint/include" before running ./configure ***])])
+
+    # Default FLINT
+    AC_CHECK_LIB([flint],[fmpz_init],
+        [],
+        [AC_MSG_ERROR([*** FLINT library not found. Try to set LDFLAGS ***])])
+
+    # Check ARB as part of FLINT
+    AC_CHECK_LIB([flint],[arb_init],
+        [],
+        [AC_MSG_ERROR([*** Arb functions not found in FLINT library. Please upgrade your FLINT version and set LDFLAGS appropriately. ***])])
+
+   # Default MPFR
+   AC_CHECK_LIB([mpfr],[mpfr_init2], [], [AC_MSG_ERROR([*** MPFR library not found. Try to set LDFLAGS ***])])
+
+   # Default CUDD
+   AC_CHECK_LIB([cudd],[Cudd_Init], [], [AC_MSG_ERROR([*** CUDD library not found. Try to set LDFLAGS ***])])
 fi
-
-#
-# Default CUDD
-#
-if test $use_mcsat = yes ; then 
-   AC_CHECK_LIB([cudd],[Cudd_Init], [], [AC_MSG_ERROR([*** CUDD library not found. Try to set LDFLAGS ***])])   
-fi
-
 
 #
 # Fix MKDIR_P to an absolute path if it's set to './install-sh -c -d'

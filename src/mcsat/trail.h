@@ -23,6 +23,7 @@
 #include "mcsat/model.h"
 #include "mcsat/mcsat_types.h"
 #include "mcsat/gc.h"
+#include "mcsat/nta_info.h"
 
 typedef enum {
   /** A decided value */
@@ -45,6 +46,9 @@ struct mcsat_trail_s {
 
   /** The variable database */
   const variable_db_t* var_db;
+
+  /** NTA info (for delta mode tracking) */
+  const nta_info_t* nta_info;
 
   /** Trail elements */
   ivector_t elements;

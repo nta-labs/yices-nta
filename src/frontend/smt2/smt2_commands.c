@@ -41,6 +41,7 @@
 #include "api/yices_globals.h"
 #include "api/yices_mutex.h"
 #include "context/context.h"
+#include "context/context_utils.h"
 #include "frontend/common/bug_report.h"
 #include "frontend/common/parameters.h"
 #include "frontend/common/tables.h"
@@ -51,6 +52,7 @@
 #include "io/term_printer.h"
 #include "frontend/smt2/smt2_symbol_printer.h"
 #include "mcsat/options.h"
+#include "mcsat/solver.h"
 #include "model/model_eval.h"
 #include "model/projection.h"
 #include "solvers/bv/dimacs_printer.h"
@@ -1550,6 +1552,14 @@ static void __attribute__((noreturn)) bad_status_bug(FILE *f) {
  * PRINT STATUS AND STATISTICS
  */
 static void show_status(smt_status_t status) {
+  if (status == YICES_STATUS_SAT) {
+    context_t* ctx = __smt2_globals.ctx;
+    if (ctx != NULL && context_has_mcsat(ctx) && mcsat_delta_used_in_trail(ctx->mcsat)) {
+      print_out("sat (delta mode used with delta %"PRId32")\n", mcsat_get_nta_delta(ctx->mcsat));
+      flush_out();
+      return;
+    }
+  }
   print_out("%s\n", status2string[status]);
   flush_out();
 }
@@ -2641,6 +2651,10 @@ static void init_smt2_context(smt2_globals_t *g) {
   g->ctx->mcsat_options = g->mcsat_options;
   ivector_copy(&g->ctx->mcsat_var_order, g->var_order.data, g->var_order.size);
 
+  if (g->ctx->mcsat != NULL) {
+    mcsat_set_use_period_for_sin(g->ctx->mcsat, !g->ctx->mcsat_options.no_sin_period);
+  }
+
   /*
    * TODO: override the default context options based on
    * ctx_parameters.  I don't want to do it now (2015/07/22). If we
@@ -3066,11 +3080,11 @@ static void check_delayed_assertions(smt2_globals_t *g, bool report) {
   // set frozen to true to disallow more assertions
   g->frozen = true;
 
-  if (g->trivially_unsat) {
+  if (false) { //g->trivially_unsat in original Yices
     trace_printf(g->tracer, 3, "(check-sat: trivially unsat)\n");
     if (report)
       report_status(g, YICES_STATUS_UNSAT);
-  } else if (trivially_true_assertions(g->assertions.data, g->assertions.size, &model)) {
+  } else if (false) { //trivially_true_assertions(g->assertions.data, g->assertions.size, &model) in original Yices
     trace_printf(g->tracer, 3, "(check-sat: trivially true)\n");
     g->trivially_sat = true;
     g->model = model;
@@ -5377,12 +5391,28 @@ static bool yices_get_option(smt2_globals_t *g, yices_param_t p) {
     print_boolean_value(g->mcsat_options.na_nlsat);
     break;
 
+  case PARAM_MCSAT_NO_SIN_PERIOD:
+    print_boolean_value(g->mcsat_options.no_sin_period);
+    break;
+
+  case PARAM_MCSAT_NTA_DELTA:
+    print_int32_value(g->mcsat_options.nta_delta);
+    break;
+
+  case PARAM_MCSAT_DIV_NEQ0:
+    print_boolean_value(g->mcsat_options.div_neq0);
+    break;
+
   case PARAM_MCSAT_RAND_DEC_FREQ:
     print_float_value(g->parameters.randomness);
     break;
 
   case PARAM_MCSAT_RAND_DEC_SEED:
     print_int32_value(g->parameters.random_seed);
+    break;
+
+  case PARAM_MCSAT_BOOL_FREQ:
+    printf("%f", g->mcsat_options.bool_freq);
     break;
 
   case PARAM_MCSAT_VAR_ORDER:
@@ -5664,6 +5694,7 @@ static void yices_set_option(smt2_globals_t *g, const char *param, const param_v
   bool tt;
   int32_t n;
   double x;
+  double r;
   branch_t b;
   ef_gen_option_t gen;
   ivector_t* terms;
@@ -6131,6 +6162,28 @@ static void yices_set_option(smt2_globals_t *g, const char *param, const param_v
     }
     break;
 
+  case PARAM_MCSAT_NO_SIN_PERIOD:
+    if (param_val_to_bool(param, val, &tt, &reason)) {
+      g->mcsat_options.no_sin_period = tt;
+      context = g->ctx;
+      if (context != NULL) {
+        context->mcsat_options.no_sin_period = tt;
+      }
+    }
+    break;
+
+  case PARAM_MCSAT_NTA_DELTA:
+    if (param_val_to_pos32(param, val, &n, &reason)) {
+      g->mcsat_options.nta_delta = n;
+      g->mcsat_options.nta_delta_set = true;
+      context = g->ctx;
+      if (context != NULL) {
+        context->mcsat_options.nta_delta = n;
+        context->mcsat_options.nta_delta_set = true;
+      }
+    }
+    break;
+
   case PARAM_MCSAT_NA_BOUND:
     if (param_val_to_bool(param, val, &tt, &reason)) {
       g->mcsat_options.na_bound = tt;
@@ -6171,6 +6224,16 @@ static void yices_set_option(smt2_globals_t *g, const char *param, const param_v
     }
     break;
 
+  case PARAM_MCSAT_DIV_NEQ0:
+    if (param_val_to_bool(param, val, &tt, &reason)) {
+      g->mcsat_options.div_neq0 = tt;
+      context = g->ctx;
+      if (context != NULL) {
+        context->mcsat_options.div_neq0 = tt;
+      }
+    }
+    break;
+
   case PARAM_MCSAT_RAND_DEC_FREQ:
     if (param_val_to_ratio(param, val, &x, &reason)) {
       g->parameters.randomness = x;
@@ -6180,6 +6243,12 @@ static void yices_set_option(smt2_globals_t *g, const char *param, const param_v
   case PARAM_MCSAT_RAND_DEC_SEED:
     if (param_val_to_pos32(param, val, &n, &reason)) {
       g->parameters.random_seed = n;
+    }
+    break;
+
+  case PARAM_MCSAT_BOOL_FREQ:
+    if (param_val_to_ratio(param, val, &r, &reason)) {
+      g->mcsat_options.bool_freq = r;
     }
     break;
 
@@ -6744,10 +6813,12 @@ void smt2_check_sat(void) {
        * Non incremental
        */
       if (__smt2_globals.efmode) {
+        printf("efsolve\n");
         efsolve_cmd(&__smt2_globals);
       } else if (__smt2_globals.frozen) {
         print_error("multiple calls to (check-sat) are not allowed in non-incremental mode");
       } else if (__smt2_globals.produce_unsat_cores) {
+        printf("delayed\n");
         delayed_assertions_unsat_core(&__smt2_globals);
       } else {
         // show_delayed_assertions(&__smt2_globals);

@@ -375,6 +375,7 @@ mcsat_src_c := \
 	mcsat/na/na_plugin_explain.c \
 	mcsat/na/na_libpoly.c \
 	mcsat/na/feasible_set_db.c \
+	mcsat/na/nta_functions.c \
 	mcsat/ff/ff_plugin.c \
 	mcsat/ff/ff_plugin_internal.c \
 	mcsat/ff/ff_plugin_explain.c \
@@ -395,6 +396,7 @@ mcsat_src_c := \
 	mcsat/bv/explain/full_bv_sat.c \
 	mcsat/bv/explain/full_bv_trivial.c \
 	mcsat/watch_list_manager.c \
+	mcsat/nta_info.c \
 	mcsat/preprocessor.c \
 	mcsat/options.c
 
@@ -755,7 +757,11 @@ endif
 #
 # include dirs: we want -I. first
 #
-CPPFLAGS := -I. -Iinclude $(CPPFLAGS)
+ifneq ($(FLINT_INCLUDE_DIR),)
+  CPPFLAGS := -I. -Iinclude -I$(FLINT_INCLUDE_DIR) $(CPPFLAGS)
+else
+  CPPFLAGS := -I. -Iinclude $(CPPFLAGS)
+endif
 
 #
 # Warning levels: dropped the flag -Winiline in all build modes.
@@ -890,7 +896,11 @@ ifneq ($(STATIC_LIBPOLY_INCLUDE_DIR),)
   STATIC_CPP_LIBPOLY := -I$(STATIC_LIBPOLY_INCLUDE_DIR)
 endif
 
-STATIC_CPPFLAGS := $(STATIC_CPP_GMP) $(STATIC_CPP_LIBPOLY) $(CPPFLAGS)
+ifneq ($(FLINT_INCLUDE_DIR),)
+  STATIC_CPP_FLINT := -I$(FLINT_INCLUDE_DIR)
+endif
+
+STATIC_CPPFLAGS := $(STATIC_CPP_GMP) $(STATIC_CPP_LIBPOLY) $(STATIC_CPP_FLINT) $(CPPFLAGS)
 
 #
 # For building dll linked statically with libgmp.a
@@ -899,11 +909,11 @@ STATIC_CPPFLAGS := $(STATIC_CPP_GMP) $(STATIC_CPP_LIBPOLY) $(CPPFLAGS)
 # we also add the NOYICES_DLL flag.
 #
 ifeq ($(POSIXOS),cygwin)
-  STATIC_DLL_CPPFLAGS := $(STATIC_CPP_GMP) $(STATIC_CPP_LIBPOLY) $(CPPFLAGS)
+  STATIC_DLL_CPPFLAGS := $(STATIC_CPP_GMP) $(STATIC_CPP_LIBPOLY) $(STATIC_CPP_FLINT) $(CPPFLAGS)
   STATIC_CPPFLAGS += -DNOYICES_DLL
 else
 ifeq ($(POSIXOS),mingw)
-  STATIC_DLL_CPPFLAGS := $(STATIC_CPP_GMP) $(STATIC_CPP_LIBPOLY) $(CPPFLAGS)
+  STATIC_DLL_CPPFLAGS := $(STATIC_CPP_GMP) $(STATIC_CPP_LIBPOLY) $(STATIC_CPP_FLINT) $(CPPFLAGS)
   STATIC_CPPFLAGS += -DNOYICES_DLL
 endif
 endif

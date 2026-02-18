@@ -1210,12 +1210,34 @@ void na_plugin_explain_conflict(na_plugin_t* na, const int_mset_t* pos, const in
       if (p_inference_reason != NULL) {
         is_inference = true;
         lp_projection_map_add(&projection_map, p_inference_reason);
+        // print adding p_inference_reason
+        if (ctx_trace_enabled(na->ctx, "na::nta")) {
+          ctx_trace_printf(na->ctx, "\nadding inference reason for constraint ");
+          poly_constraint_print(constraint, ctx_trace_out(na->ctx));
+          ctx_trace_printf(na->ctx, ": ");
+          lp_polynomial_print(p_inference_reason, ctx_trace_out(na->ctx));
+          ctx_trace_printf(na->ctx, "\n");
+        }
         lp_polynomial_delete(p_inference_reason);
+      }
+      else{
+        if (ctx_trace_enabled(na->ctx, "na::nta")) {
+          ctx_trace_printf(na->ctx, "\nnot adding inference reason for constraint ");
+          poly_constraint_print(constraint, ctx_trace_out(na->ctx));
+          ctx_trace_printf(na->ctx, "\n");
+        }
       }
     }
     if (!is_inference) {
       const lp_polynomial_t* p = poly_constraint_get_polynomial(constraint);
       lp_projection_map_add(&projection_map, p);
+      if (ctx_trace_enabled(na->ctx, "na::nta")) {
+        ctx_trace_printf(na->ctx, "\nadding original polynomial for constraint ");
+        poly_constraint_print(constraint, ctx_trace_out(na->ctx));
+        ctx_trace_printf(na->ctx, ": ");
+        lp_polynomial_print(p, ctx_trace_out(na->ctx));
+        ctx_trace_printf(na->ctx, "\n");
+      }
     }
 
   }
