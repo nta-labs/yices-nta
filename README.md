@@ -32,7 +32,7 @@ autoconf
 ./configure --enable-mcsat
 make
 ```
-The binary will be placed in `./build/x86_64-pc-linux-gnu-release/bin/yices_smt2
+The binary will be placed in ./build/x86_64-pc-linux-gnu-release/bin/yices_smt2
 
 ## Troubleshooting
 
@@ -49,7 +49,43 @@ The binary will be placed in `./build/x86_64-pc-linux-gnu-release/bin/yices_smt2
    to `#include <arb.h>` and `#include <arf.h>`. These appear only in the files 
    `src/mcsat/na/nta_functions.h` and `src/mcsat/na/nta_functions.c`.
 
-## Diff with Yices2 
+# Running the tool 
+
+Given an instance.smt2 file, run the tool with: 
+
+`./build/x86_64-pc-linux-gnu-release/bin/yices_smt2 instance.smt2`
+
+The input file should contain `(set-logic QF_NRA)` at the beginning of the file. 
+Functions `sin` and `exp`, as well as the constant `pi` must be defined explicitly in the file, 
+even thought they are treated as interpreted functions. Here is an example:
+
+```
+(set-logic QF_NRA)
+(declare-fun sin (Real) Real)
+(declare-fun pi () Real)
+(declare-fun x_1 () Real)
+(declare-fun x_2 () Real)
+(declare-fun x_0 () Real)
+(assert (let ((.def_10 (* (/ 1 2) pi)))
+(let ((.def_25 (+ .def_10 x_1)))
+(let ((.def_26 (sin .def_25)))
+(let ((.def_27 (/ x_1 .def_26)))
+(let ((.def_28 (= x_2 .def_27)))
+(let ((.def_17 (= x_0 x_1)))
+(let ((.def_15 (= x_0 (+ 0 2))))
+(let ((.def_18 (and .def_15 .def_17)))
+(let ((.def_29 (and .def_18 .def_28)))
+(let ((.def_23 (= x_1 (+ 0 2))))
+(let ((.def_30 (and .def_23 .def_29)))
+.def_30))))))))))))
+(check-sat)
+```
+If you want to print the model, add the options `--yices-model-format --dump-models`. 
+Note that, in addition to variables, these options may show assignments to arbitrary terms. 
+When verifying a solution, ignore values assigned to these terms, as they are artifacts of 
+internal computations performed by the tool.
+
+# Diff with Yices2 
 
 Apart form the commit adding this README, the repository contains 
 [another commit](https://github.com/nta-labs/yices-nta/commit/5a55cdb8408ba82958e39a5c08313df697d59fff)
