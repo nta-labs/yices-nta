@@ -17,11 +17,14 @@ On top of the libraries required by Yices2 in order to run in MCSAT mode,
 we require the library FLINT to perform interval arithmetic in arbitrary precision.
 Here is a short guide for the installation:
 
+1. Install GNU [gperf](https://www.gnu.org/software/gperf/).
+
 1. Install SRI's library for polynomial manipulation. It's available
    on [github](https://github.com/SRI-CSL/libpoly).
 
 2. Install the CUDD library for binary-decision diagrams. We recommend
-   using the github distribution: https://github.com/ivmai/cudd.
+   using the github distribution: https://github.com/ivmai/cudd. During installation, 
+   run `./configure` with option `--enable-shared`.
 
 3. Install the FLINT libary: https://flintlib.org/. 
 
@@ -32,13 +35,13 @@ autoconf
 ./configure --enable-mcsat
 make
 ```
-The binary will be placed in ./build/x86_64-pc-linux-gnu-release/bin/yices_smt2
+The binary will be placed in `./build/x86_64-pc-linux-gnu-release/bin/yices_smt2
 
 ## Troubleshooting
 
-1. You may need to provide `LDFLAGS/CPPFLAGS` if `./configure` fails to
-  find the libpoly, CUDD or FLINT libraries. Other options may be useful too.  
-  Try `./configure --help` to see what's there.
+1. During Step 2 (CUDD installation), during `make` you might encounter the error 
+   `[Makefile:983: aclocal.m4] Error 127`. In this case, perform `autoreconf -fi` 
+   and run again `./configure --enable-shared`.
 
 2. We only use the ARB module of FLINT. This used to be a separated library. 
    Depending on the version of FLINT, or on whether you already had ARB installed 
@@ -47,7 +50,11 @@ The binary will be placed in ./build/x86_64-pc-linux-gnu-release/bin/yices_smt2
    source code of the tool, updating the includes
    `#include <flint/arb.h>` and `#include <flint/arf.h>` 
    to `#include <arb.h>` and `#include <arf.h>`. These appear only in the files 
-   `src/mcsat/na/nta_functions.h` and `src/mcsat/na/nta_functions.c`.
+   `src/mcsat/tra/tra_functions.h` and `src/mcsat/tra/tra_functions.c`.
+
+1. As usual, you may need to provide `LDFLAGS/CPPFLAGS` if `./configure` fails to
+   find the relevant libraries. Other options may be useful too.  
+   Try `./configure --help` to see what's there.
 
 # Running the tool 
 
@@ -87,7 +94,6 @@ internal computations performed by the tool.
 
 # Diff with Yices2 
 
-Apart form the commit adding this README, the repository contains 
-[another commit](https://github.com/nta-labs/yices-nta/commit/5a55cdb8408ba82958e39a5c08313df697d59fff)
+The commit [5a55cdb8](https://github.com/nta-labs/yices-nta/commit/5a55cdb8408ba82958e39a5c08313df697d59fff)
 that applies all updates needed to extend Yices2 to Yices-NTA. You can 
 inspect the differences between the two tools by inspecting that commit.
