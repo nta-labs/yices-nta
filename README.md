@@ -39,15 +39,15 @@ The binary will be placed in `./build/x86_64-pc-linux-gnu-release/bin/yices_smt2
 
 ## Troubleshooting
 
-1. During Step 2 (CUDD installation), during `make` you might encounter the error 
+1. During Step 2 (CUDD installation), `make` might throw an error 
    `[Makefile:983: aclocal.m4] Error 127`. In this case, perform `autoreconf -fi` 
    and run again `./configure --enable-shared`.
 
 2. We only use the ARB module of FLINT. This used to be a separated library. 
    Depending on the version of FLINT, or on whether you already had ARB installed 
-   in your system, it might happen that arb.h and arf.h ends up in /usr/include/ 
-   instead of /usr/include/flint. If that's the case, a possible fix is to modify the 
-   source code of the tool, updating the includes
+   in your system, it might happen that `arb.h` and `arf.h` ends up in `/path/to/include/`
+   instead of `/path/to/include/flint`. If that's the case, a possible fix is 
+   to modify the source code of the tool, updating the includes
    `#include <flint/arb.h>` and `#include <flint/arf.h>` 
    to `#include <arb.h>` and `#include <arf.h>`. These appear only in the files 
    `src/mcsat/tra/tra_functions.h` and `src/mcsat/tra/tra_functions.c`.
@@ -95,5 +95,5 @@ internal computations performed by the tool.
 # Diff with Yices2 
 
 The commit [5a55cdb8](https://github.com/nta-labs/yices-nta/commit/5a55cdb8408ba82958e39a5c08313df697d59fff)
-that applies all updates needed to extend Yices2 to Yices-NTA. You can 
+applies all updates needed to extend Yices2 to Yices-NTA. You can 
 inspect the differences between the two tools by inspecting that commit.
